@@ -4,7 +4,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![ASL3](https://img.shields.io/badge/ASL-3-green.svg)](https://www.allstarlink.org/)
 
-A REST API that runs on your Raspberry Pi and gives you full HTTP control over your AllStar Link node. Connect nodes, disconnect nodes, send DTMF, execute macros, and monitor status — all via clean JSON endpoints.
+A REST API that runs on your Raspberry Pi and gives you full HTTP control over your AllStar Link node. Connect nodes, disconnect nodes, send DTMF, execute macros, trigger COP commands, monitor live keyed state, and look up any node in the AllStar network — all via clean JSON endpoints.
 
 Built for ASL3 / Asterisk 22 on Debian (Raspberry Pi 4B tested).
 
@@ -25,22 +25,45 @@ AllStar Link nodes are controlled through the Asterisk Manager Interface (AMI) �
 
 ## Endpoints
 
-All endpoints except `/ping` require an `X-API-Key` header.
+Endpoints marked **Key** require an `X-API-Key` header. Control endpoints are also rate-limited per IP (configurable, default 60/minute).
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/ping` | Health check — no auth required |
-| GET | `/status` | Node uptime, keyup count, TX time, DTMF stats |
-| GET | `/nodes` | List of currently connected nodes with mode |
-| GET | `/lookup/{node}` | Look up any node's callsign and location |
-| POST | `/connect` | Connect to a remote node (transceive or monitor) |
-| POST | `/disconnect` | Disconnect from a specific node |
-| POST | `/disconnect-all` | Drop all active connections |
-| POST | `/dtmf` | Send a DTMF sequence to your node |
-| POST | `/macro` | Execute a macro defined in rpt.conf |
-| GET | `/audit` | Recent command history |
+### Health
 
-Full request/response documentation is available at `http://your-pi-ip:8073/docs` once the service is running (FastAPI auto-generates it).
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| GET | `/ping` | None | Live AMI health check — confirms API is up and Asterisk is responding |
+| GET | `/version` | None | Version info, Python version, node cache stats |
+
+### Node
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| GET | `/status` | Key | Node uptime, keyup count, TX time, DTMF stats. Add `?raw=true` for raw AMI output. |
+| GET | `/nodes` | Key | Connected nodes with mode (T/M/R). Add `?enrich=true` for callsign and location. |
+| GET | `/variables` | Key | Live app_rpt variables: keyed state, TX state, link count, autopatch state |
+| GET | `/lookup/{node}` | Key | Callsign, location, description for any AllStar node. Served from local cache. |
+
+### Control
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| POST | `/connect` | Key | Connect to a remote node (transceive or monitor-only) |
+| POST | `/disconnect` | Key | Disconnect from a specific node |
+| POST | `/disconnect-all` | Key | Drop all active connections |
+| POST | `/dtmf` | Key | Send a DTMF sequence to your node |
+| POST | `/macro` | Key | Execute a macro defined in rpt.conf |
+| POST | `/cop/identify` | Key | Play node ID over the air (COP 10) |
+| POST | `/cop/time` | Key | Say current time over the air (COP 12) |
+| POST | `/cop/status` | Key | Say system status over the air (COP 13) |
+| POST | `/cop/version` | Key | Say app_rpt version over the air (COP 14) |
+
+### Admin
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| GET | `/audit` | Key | Recent command history |
+
+Full interactive documentation is available at `http://your-pi-ip:8073/docs` once the service is running (FastAPI auto-generates it).
 
 ---
 
@@ -66,7 +89,7 @@ chmod +x install.sh
 ./install.sh
 ```
 
-The installer will walk you through each step, explain what it is doing, and ask for confirmation before making any changes. If you have already read the docs and just want it done:
+The installer walks you through each step, explains what it is doing, and asks for confirmation before making any changes. If you have already read the docs and just want it done:
 
 ```bash
 ./install.sh --auto
@@ -107,8 +130,26 @@ If `ami_connected` is `false`, see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTIN
 API_KEY="your-api-key-here"
 PI="http://192.168.1.x:8073"
 
-# Check node status
+# Health check (no auth)
+curl $PI/ping
+curl $PI/version
+
+# Node status
 curl -H "X-API-Key: $API_KEY" $PI/status
+curl -H "X-API-Key: $API_KEY" "$PI/status?raw=true"
+
+# Live keyed state and link info
+curl -H "X-API-Key: $API_KEY" $PI/variables
+
+# Connected nodes (bare)
+curl -H "X-API-Key: $API_KEY" $PI/nodes
+
+# Connected nodes with callsign and location
+curl -H "X-API-Key: $API_KEY" "$PI/nodes?enrich=true"
+
+# Look up any AllStar node (served from local cache, instant)
+curl -H "X-API-Key: $API_KEY" $PI/lookup/55553
+curl -H "X-API-Key: $API_KEY" $PI/lookup/674982
 
 # Connect to a node (transceive)
 curl -s -X POST -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
@@ -125,14 +166,37 @@ curl -s -X POST -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
 # Drop all connections
 curl -s -X POST -H "X-API-Key: $API_KEY" $PI/disconnect-all
 
-# Send DTMF
+# Send DTMF (confirmed must be true)
 curl -s -X POST -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
   -d '{"sequence": "*81", "confirmed": true}' $PI/dtmf
 
 # Execute a macro (must be defined in rpt.conf first)
 curl -s -X POST -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
   -d '{"macro_number": "1"}' $PI/macro
+
+# COP commands (play over the air)
+curl -s -X POST -H "X-API-Key: $API_KEY" $PI/cop/identify
+curl -s -X POST -H "X-API-Key: $API_KEY" $PI/cop/time
+curl -s -X POST -H "X-API-Key: $API_KEY" $PI/cop/status
+curl -s -X POST -H "X-API-Key: $API_KEY" $PI/cop/version
+
+# Audit log
+curl -H "X-API-Key: $API_KEY" "$PI/audit?lines=20"
 ```
+
+---
+
+## Key Features
+
+**Node database cache** — On startup, ASL3-API fetches the AllStar node database (~40,000 nodes) and holds it in memory. `/lookup` calls are instant with no external HTTP request. The cache refreshes every 15 minutes per the official AllStar cache policy.
+
+**Live keyed state** — `/variables` returns `rxkeyed` (signal present on node input) sourced directly from Asterisk via AMI. No external API calls, no rate limits.
+
+**Rate limiting** — Control endpoints are rate-limited per IP. Default is 60 requests/minute, configurable in `config.yaml`.
+
+**Startup validation** — Required config fields are checked before the service binds. Clear error messages if anything is missing.
+
+**Structured data** — Uptime and TX time are returned as structured objects with `raw`, `seconds` (integer), and `display` (human-readable) fields for easy client consumption.
 
 ---
 
@@ -163,17 +227,19 @@ nano /opt/asl3-api/config.yaml
 sudo systemctl restart asl3-api
 ```
 
-The `config.yaml.example` file in this repo documents every available option.
+The `config.yaml.example` file in this repo documents every available option including timeout tuning for slow or intercontinental links.
 
 ---
 
 ## Security
 
 - All control endpoints require an API key sent in the `X-API-Key` header
+- Control endpoints are rate-limited per IP (configurable)
 - AMI is bound to localhost only and cannot be accessed externally
 - The service runs as your existing node user — no new system accounts created
 - `config.yaml` is set to 600 permissions (readable only by your user)
 - The systemd service includes hardening flags: `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem`
+- Required config fields are validated on startup — misconfigured services fail fast with a clear error
 
 For remote access (outside your LAN), use Tailscale or a Cloudflare Tunnel rather than exposing port 8073 directly to the internet.
 
@@ -194,9 +260,8 @@ See [docs/SECURITY.md](docs/SECURITY.md) for full security guidance.
 
 ## Known Issues
 
-- Node connection verification takes approximately 8 seconds (this is an AllStar/Asterisk timing constraint, not an API bug)
-- Webhook notifications are implemented but disabled by default pending real-world testing
-- Uptime is reported as a raw string from `rpt stats` — formatting varies by ASL3 version
+- Node connection verification takes approximately 8-12 seconds (AllStar/Asterisk timing constraint, not an API bug). Configurable via `timeouts.connect_max_seconds` in config.yaml.
+- Webhook notifications are implemented but disabled by default pending real-world testing.
 
 ---
 
