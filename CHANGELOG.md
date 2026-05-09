@@ -7,6 +7,28 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.3.0] - 2026-05-09
+
+### Added
+
+- `GET /version` — no-auth endpoint returning version string, Python version, node info, and node cache stats
+- `GET /variables` — live app_rpt node variables via `rpt show variables`: `rxkeyed` (signal on input), `txkeyed` (transmitter active), `ext_txkeyed`, `num_links`, `links`, `num_active_links`, `active_links`, `autopatch_up`. Sourced directly from local AMI — no external API, no rate limits.
+- `POST /cop/identify` — play node ID over the air (COP 10)
+- `POST /cop/time` — say current time over the air (COP 12)
+- `POST /cop/status` — say system status over the air (COP 13)
+- `POST /cop/version` — say app_rpt software version over the air (COP 14)
+- `AMIClient.cop()` — generic COP command executor
+- `AMIClient.get_node_variables()` — fetches and parses `rpt show variables` output
+- `AMIClient._parse_variables_response()` — parser for RPT variable output
+
+### Notes
+
+- `keyed` state is sourced from `RPT_RXKEYED` via local AMI (`rpt show variables`), not the external stats API. This avoids rate limiting and external dependency.
+- COP numbers 10, 12, 13, 14 confirmed working on ASL3 / Asterisk 22.8.2 / Debian 13.
+- `rpt showvars` is not a valid ASL3 command — use `rpt show variables` instead.
+
+---
+
 ## [1.2.0] - 2026-05-09
 
 ### Added
@@ -86,6 +108,7 @@ Initial public release.
 
 ---
 
+[1.3.0]: https://github.com/KJ5IRQ/asl3-api/releases/tag/v1.3.0
 [1.2.0]: https://github.com/KJ5IRQ/asl3-api/releases/tag/v1.2.0
 [1.1.0]: https://github.com/KJ5IRQ/asl3-api/releases/tag/v1.1.0
 [1.0.0]: https://github.com/KJ5IRQ/asl3-api/releases/tag/v1.0.0

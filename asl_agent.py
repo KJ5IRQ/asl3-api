@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import re
+import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
@@ -92,7 +93,7 @@ limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(
     title="ASL3-API",
     description="REST API for AllStar Link node monitoring and control.",
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -220,6 +221,24 @@ async def ping():
     }
 
 
+@app.get("/version", tags=["Health"])
+async def version():
+    """
+    Return version information. No authentication required.
+
+    Useful for verifying which version is deployed, especially when
+    running multiple nodes with different ASL3-API versions.
+    """
+    return {
+        "version": app.version,
+        "python": sys.version.split()[0],
+        "node": config.node_number,
+        "callsign": config.node_callsign,
+        "node_cache_size": node_cache.size,
+        "node_cache_last_updated": node_cache.last_updated,
+    }
+
+
 @app.get("/status", dependencies=[Depends(verify_api_key)], tags=["Node"])
 async def get_status(raw: bool = False):
     """Return node statistics: uptime, keyup count, TX time, DTMF stats.
@@ -251,6 +270,29 @@ async def get_nodes(enrich: bool = False):
         return {"connected_nodes": nodes, "count": len(nodes)}
     except Exception as e:
         logger.error(f"/nodes error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/variables", dependencies=[Depends(verify_api_key)], tags=["Node"])
+async def get_variables():
+    """
+    Return live app_rpt node variables.
+
+    Includes keyed state (rxkeyed), transmitter state (txkeyed),
+    link counts, autopatch state, and more. Sourced directly from
+    Asterisk via AMI -- no external API calls, no caching.
+
+    Key fields:
+      rxkeyed       - true if a signal is currently present on the node input
+      txkeyed       - true if the transmitter is currently active
+      num_links     - number of currently connected links
+      autopatch_up  - true if autopatch is active
+    """
+    try:
+        variables = await ami_client.get_node_variables()
+        return variables
+    except Exception as e:
+        logger.error(f"/variables error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -374,6 +416,68 @@ async def execute_macro(request: Request, body: MacroRequest):
         }
     except Exception as e:
         logger.error(f"/macro error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/cop/identify", dependencies=[Depends(verify_api_key)], tags=["Control"])
+@limiter.limit(lambda: f"{config.rate_limit}/minute")
+async def cop_identify(request: Request):
+    """
+    Play the node ID over the air. Equivalent to COP 10.
+
+    Triggers the node's configured identification announcement.
+    """
+    try:
+        result = await ami_client.cop(10)
+        audit_log("cop/identify")
+        return {"success": True, "message": "Node ID playback triggered"}
+    except Exception as e:
+        logger.error(f"/cop/identify error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/cop/time", dependencies=[Depends(verify_api_key)], tags=["Control"])
+@limiter.limit(lambda: f"{config.rate_limit}/minute")
+async def cop_time(request: Request):
+    """
+    Say the current time over the air. Equivalent to COP 12.
+    """
+    try:
+        result = await ami_client.cop(12)
+        audit_log("cop/time")
+        return {"success": True, "message": "Time announcement triggered"}
+    except Exception as e:
+        logger.error(f"/cop/time error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/cop/status", dependencies=[Depends(verify_api_key)], tags=["Control"])
+@limiter.limit(lambda: f"{config.rate_limit}/minute")
+async def cop_status(request: Request):
+    """
+    Say the system status over the air. Equivalent to COP 13.
+    """
+    try:
+        result = await ami_client.cop(13)
+        audit_log("cop/status")
+        return {"success": True, "message": "System status announcement triggered"}
+    except Exception as e:
+        logger.error(f"/cop/status error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/cop/version", dependencies=[Depends(verify_api_key)], tags=["Control"])
+@limiter.limit(lambda: f"{config.rate_limit}/minute")
+async def cop_version(request: Request):
+    """
+    Say the app_rpt software version over the air. Equivalent to COP 14.
+    """
+    try:
+        result = await ami_client.cop(14)
+        audit_log("cop/version")
+        return {"success": True, "message": "Version announcement triggered"}
+    except Exception as e:
+        logger.error(f"/cop/version error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

@@ -91,6 +91,25 @@ class AMIClient:
     # Node status
     # ------------------------------------------------------------------
 
+    async def get_node_variables(self) -> Dict:
+        """
+        Get app_rpt variables for the configured node.
+
+        Uses 'rpt show variables {node}' which returns:
+          RPT_RXKEYED     - 1 if signal present on input (node is being keyed)
+          RPT_TXKEYED     - 1 if transmitter is active
+          RPT_ETXKEYED    - 1 if external TX is keyed
+          RPT_NUMLINKS    - number of connected links
+          RPT_LINKS       - comma-separated link list
+          RPT_NUMALINKS   - number of active links
+          RPT_ALINKS      - active link list
+          RPT_AUTOPATCHUP - 1 if autopatch is active
+        """
+        response = await self.send_command(
+            f"rpt show variables {config.node_number}"
+        )
+        return self._parse_variables_response(response)
+
     async def get_node_stats(self, include_raw: bool = False) -> Dict:
         """Return parsed statistics for the configured node."""
         response = await self.send_command(f"rpt stats {config.node_number}")
@@ -195,6 +214,27 @@ class AMIClient:
         command = f"rpt cmd {config.node_number} cop 6 {macro_number}"
         await self.send_command(command)
         return {"success": True, "command": command, "macro_number": macro_number}
+
+    # ------------------------------------------------------------------
+    # COP (Control Operator) commands
+    # ------------------------------------------------------------------
+
+    async def cop(self, cop_number: int) -> Dict:
+        """
+        Execute a COP (Control Operator) command.
+
+        COP commands confirmed on ASL3:
+          10 - Play node ID
+          12 - Say current time
+          13 - Say system status
+          14 - Say app_rpt software version
+
+        Note: rpt showvars is not a valid ASL3 command.
+        Use get_node_variables() instead.
+        """
+        command = f"rpt cmd {config.node_number} cop {cop_number}"
+        await self.send_command(command)
+        return {"success": True, "command": command, "cop": cop_number}
 
     # ------------------------------------------------------------------
     # Response parsers
@@ -416,6 +456,71 @@ class AMIClient:
                     nodes.append({"node": node_num, "mode": mode, "info": ""})
 
         return nodes
+
+    def _parse_variables_response(self, response: Dict) -> Dict:
+        """
+        Parse 'rpt show variables' output into a structured dict.
+
+        Output format:
+          Variable listing for node NNNNNN:
+             RPT_RXKEYED=0
+             RPT_TXKEYED=1
+             ...
+
+        Boolean fields (RPT_RXKEYED, RPT_TXKEYED, RPT_ETXKEYED,
+        RPT_AUTOPATCHUP) are returned as Python bools.
+        Integer fields (RPT_NUMLINKS, RPT_NUMALINKS) as ints.
+        String fields (RPT_LINKS, RPT_ALINKS) as str or None.
+        """
+        output = response.get("Output", [])
+        if isinstance(output, str):
+            output = [output]
+
+        result = {
+            "rxkeyed": None,
+            "txkeyed": None,
+            "ext_txkeyed": None,
+            "num_links": None,
+            "links": None,
+            "num_active_links": None,
+            "active_links": None,
+            "autopatch_up": None,
+        }
+
+        bool_map = {
+            "RPT_RXKEYED": "rxkeyed",
+            "RPT_TXKEYED": "txkeyed",
+            "RPT_ETXKEYED": "ext_txkeyed",
+            "RPT_AUTOPATCHUP": "autopatch_up",
+        }
+        int_map = {
+            "RPT_NUMLINKS": "num_links",
+            "RPT_NUMALINKS": "num_active_links",
+        }
+        str_map = {
+            "RPT_LINKS": "links",
+            "RPT_ALINKS": "active_links",
+        }
+
+        for line in output:
+            line = line.strip()
+            if "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip()
+
+            if key in bool_map:
+                result[bool_map[key]] = val == "1"
+            elif key in int_map:
+                try:
+                    result[int_map[key]] = int(val)
+                except ValueError:
+                    result[int_map[key]] = val
+            elif key in str_map:
+                result[str_map[key]] = val if val else None
+
+        return result
 
 
 # Global singleton used by asl_agent.py and event_handler.py
