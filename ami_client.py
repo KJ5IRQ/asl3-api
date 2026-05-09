@@ -518,7 +518,8 @@ class AMIClient:
                 except ValueError:
                     result[int_map[key]] = val
             elif key in str_map:
-                result[str_map[key]] = val if val else None
+                # ASL3 uses "0" as a sentinel for empty link lists
+                result[str_map[key]] = val if val and val != "0" else None
 
         return result
 
