@@ -201,13 +201,15 @@ class AMIClient:
         """
         Look up a node's callsign and location from the AllStar node database.
 
-        Queries the public AllStar API. Returns None values for each field
-        if the node is not found or the lookup fails. This is a best-effort
-        call — failures are logged but do not raise exceptions.
+        Fetches the allmondb node list and parses the matching entry.
+        Format: node|callsign|description|location
+
+        Returns None values for each field if the node is not found
+        or the lookup fails. Failures are logged but do not raise.
         """
         import aiohttp as aio
 
-        url = f"https://www.allstarlink.org/cgi-bin/node.pl?node={node_number}"
+        url = "https://allmondb.allstarlink.org/allmondb.php"
         result = {
             "node": node_number,
             "callsign": None,
@@ -218,29 +220,28 @@ class AMIClient:
         try:
             async with aio.ClientSession() as session:
                 async with session.get(
-                    url, timeout=aio.ClientTimeout(total=5)
+                    url, timeout=aio.ClientTimeout(total=10)
                 ) as response:
                     if response.status != 200:
-                        logger.warning(f"Node lookup returned {response.status} for {node_number}")
+                        logger.warning(f"allmondb returned {response.status}")
                         return result
 
                     text = await response.text()
 
-                    # Parse the plain-text response format:
-                    # callsign|city,state|description|...
-                    # AllStar node.pl returns pipe-delimited plain text
-                    parts = text.strip().split("|")
-                    if len(parts) >= 1 and parts[0]:
-                        result["callsign"] = parts[0].strip()
-                    if len(parts) >= 2 and parts[1]:
-                        result["location"] = parts[1].strip()
-                    if len(parts) >= 3 and parts[2]:
-                        result["description"] = parts[2].strip()
+                    for line in text.splitlines():
+                        parts = line.split("|")
+                        if not parts:
+                            continue
+                        if parts[0].strip() == node_number:
+                            result["callsign"] = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
+                            result["description"] = parts[2].strip() if len(parts) > 2 and parts[2].strip() else None
+                            result["location"] = parts[3].strip() if len(parts) > 3 and parts[3].strip() else None
+                            break
 
         except asyncio.TimeoutError:
-            logger.warning(f"Node lookup timed out for {node_number}")
+            logger.warning(f"allmondb lookup timed out for node {node_number}")
         except Exception as e:
-            logger.warning(f"Node lookup failed for {node_number}: {e}")
+            logger.warning(f"allmondb lookup failed for node {node_number}: {e}")
 
         return result
 
