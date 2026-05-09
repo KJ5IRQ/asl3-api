@@ -7,6 +7,24 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.2.0] - 2026-05-09
+
+### Added
+
+- `node_cache.py` — in-memory cache of the AllStar node database (allmondb), fetched on startup and refreshed every 15 minutes. Eliminates per-request HTTP calls and respects the official AllStar 15-minute cache policy.
+- `GET /nodes?enrich=true` — optionally includes callsign, location, and description for each connected node, served from the node cache at zero extra cost.
+- Rate limiting via `slowapi` — control endpoints (`/connect`, `/disconnect`, `/disconnect-all`, `/dtmf`, `/macro`) are now rate-limited per IP. Configurable via `security.rate_limit_per_minute` in config.yaml.
+- Config validation on startup — required fields (`node.number`, `node.callsign`, `ami.password`, `api.api_key`) are checked before the service binds. Clear error message on failure instead of cryptic AMI errors.
+- TX time normalized — `tx_time_today` and `tx_time_total` now return structured objects (`raw`, `seconds`, `display`) matching the uptime format. Format: `HH:MM:SS:mmm` (ASL3 native).
+- Configurable connect/disconnect timeouts via `timeouts.connect_max_seconds` and `timeouts.disconnect_max_seconds` in config.yaml.
+
+### Changed
+
+- `/lookup/{node}` now served from local node cache — instant response, no external HTTP call per request.
+- `ami_client.py` — `lookup_node()` method removed; lookup is now handled entirely by `node_cache.py`.
+
+---
+
 ## [1.1.0] - 2026-05-09
 
 ### Added
@@ -68,5 +86,6 @@ Initial public release.
 
 ---
 
+[1.2.0]: https://github.com/KJ5IRQ/asl3-api/releases/tag/v1.2.0
 [1.1.0]: https://github.com/KJ5IRQ/asl3-api/releases/tag/v1.1.0
 [1.0.0]: https://github.com/KJ5IRQ/asl3-api/releases/tag/v1.0.0

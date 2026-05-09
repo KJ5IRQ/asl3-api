@@ -119,8 +119,8 @@ class AMIClient:
         command = f"rpt cmd {config.node_number} ilink {ilink_mode} {node_number}"
         await self.send_command(command)
 
-        # Poll every second up to 12 seconds for the link to appear
-        max_wait = 12
+        # Poll every second up to config timeout for the link to appear
+        max_wait = config.connect_timeout
         for _ in range(max_wait):
             await asyncio.sleep(1)
             nodes = await self.get_connected_nodes()
@@ -142,7 +142,7 @@ class AMIClient:
         command = f"rpt cmd {config.node_number} ilink 1 {node_number}"
         await self.send_command(command)
 
-        max_wait = 8
+        max_wait = config.disconnect_timeout
         for _ in range(max_wait):
             await asyncio.sleep(1)
             nodes = await self.get_connected_nodes()
@@ -194,60 +194,41 @@ class AMIClient:
         return {"success": True, "command": command, "macro_number": macro_number}
 
     # ------------------------------------------------------------------
-    # Node lookup
-    # ------------------------------------------------------------------
-
-    async def lookup_node(self, node_number: str) -> Dict:
-        """
-        Look up a node's callsign and location from the AllStar node database.
-
-        Fetches the allmondb node list and parses the matching entry.
-        Format: node|callsign|description|location
-
-        Returns None values for each field if the node is not found
-        or the lookup fails. Failures are logged but do not raise.
-        """
-        import aiohttp as aio
-
-        url = "https://allmondb.allstarlink.org/allmondb.php"
-        result = {
-            "node": node_number,
-            "callsign": None,
-            "location": None,
-            "description": None,
-        }
-
-        try:
-            async with aio.ClientSession() as session:
-                async with session.get(
-                    url, timeout=aio.ClientTimeout(total=10)
-                ) as response:
-                    if response.status != 200:
-                        logger.warning(f"allmondb returned {response.status}")
-                        return result
-
-                    text = await response.text()
-
-                    for line in text.splitlines():
-                        parts = line.split("|")
-                        if not parts:
-                            continue
-                        if parts[0].strip() == node_number:
-                            result["callsign"] = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
-                            result["description"] = parts[2].strip() if len(parts) > 2 and parts[2].strip() else None
-                            result["location"] = parts[3].strip() if len(parts) > 3 and parts[3].strip() else None
-                            break
-
-        except asyncio.TimeoutError:
-            logger.warning(f"allmondb lookup timed out for node {node_number}")
-        except Exception as e:
-            logger.warning(f"allmondb lookup failed for node {node_number}: {e}")
-
-        return result
-
-    # ------------------------------------------------------------------
     # Response parsers
     # ------------------------------------------------------------------
+
+    def _parse_tx_time(self, raw: str) -> Dict:
+        """
+        Parse TX time string from 'rpt stats' into structured fields.
+
+        ASL3 format: HH:MM:SS:mmm (hours:minutes:seconds:milliseconds)
+        Example: "00:02:14:30" = 2 minutes 14 seconds 30 milliseconds
+
+        Returns a dict with:
+          raw       - the original string as-is
+          seconds   - total whole seconds as an integer
+          display   - human-readable string e.g. "2m 14s"
+        """
+        raw = raw.strip()
+        result = {"raw": raw, "seconds": None, "display": raw}
+
+        m = re.fullmatch(r"(\d+):(\d{2}):(\d{2}):(\d+)", raw)
+        if not m:
+            return result
+
+        hours, minutes, secs, _ = (int(x) for x in m.groups())
+        total_seconds = hours * 3600 + minutes * 60 + secs
+        result["seconds"] = total_seconds
+
+        parts = []
+        if hours:
+            parts.append(f"{hours}h")
+        if minutes or hours:
+            parts.append(f"{minutes}m")
+        parts.append(f"{secs}s")
+        result["display"] = " ".join(parts)
+
+        return result
 
     def _parse_uptime(self, raw: str) -> Dict:
         """
@@ -385,10 +366,10 @@ class AMIClient:
                     stats["dtmf_commands_total"] = val
 
             elif key == "TX time today":
-                stats["tx_time_today"] = val
+                stats["tx_time_today"] = self._parse_tx_time(val)
 
             elif key == "TX time since system initialization":
-                stats["tx_time_total"] = val
+                stats["tx_time_total"] = self._parse_tx_time(val)
 
             elif key == "Last DTMF command executed":
                 stats["last_dtmf_command"] = None if val == "N/A" else val

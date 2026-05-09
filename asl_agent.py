@@ -6,12 +6,16 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Header, Request, status
 from pydantic import BaseModel, Field, field_validator
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from ami_client import ami_client
 from config import config
 from event_handler import EventHandler
+from node_cache import node_cache
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -41,8 +45,14 @@ async def lifespan(app: FastAPI):
     global _monitoring_task
 
     logger.info("ASL3-API starting...")
+    try:
+        config.validate()
+    except ValueError as e:
+        logger.critical(str(e))
+        raise
     await ami_client.connect()
     await event_handler.start()
+    await node_cache.start()
 
     if config.webhooks_enabled:
         _monitoring_task = asyncio.create_task(event_handler.monitoring_loop())
@@ -64,9 +74,16 @@ async def lifespan(app: FastAPI):
             pass
 
     await event_handler.stop()
+    await node_cache.stop()
     await ami_client.disconnect()
     logger.info("ASL3-API stopped")
 
+
+# ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+
+limiter = Limiter(key_func=get_remote_address)
 
 # ---------------------------------------------------------------------------
 # Application
@@ -75,9 +92,12 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="ASL3-API",
     description="REST API for AllStar Link node monitoring and control.",
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ---------------------------------------------------------------------------
 # Authentication
@@ -216,10 +236,17 @@ async def get_status(raw: bool = False):
 
 
 @app.get("/nodes", dependencies=[Depends(verify_api_key)], tags=["Node"])
-async def get_nodes():
-    """Return the list of nodes currently connected to this node."""
+async def get_nodes(enrich: bool = False):
+    """
+    Return the list of nodes currently connected to this node.
+
+    Add ?enrich=true to include callsign, location, and description
+    for each connected node from the AllStar node database.
+    """
     try:
         nodes = await ami_client.get_connected_nodes()
+        if enrich:
+            node_cache.enrich_node_list(nodes)
         audit_log("nodes", f"{len(nodes)} connected")
         return {"connected_nodes": nodes, "count": len(nodes)}
     except Exception as e:
@@ -228,7 +255,8 @@ async def get_nodes():
 
 
 @app.post("/connect", dependencies=[Depends(verify_api_key)], tags=["Control"])
-async def connect_node(request: ConnectRequest):
+@limiter.limit(lambda: f"{config.rate_limit}/minute")
+async def connect_node(request: Request, body: ConnectRequest):
     """
     Connect to a remote AllStar node.
 
@@ -236,17 +264,17 @@ async def connect_node(request: ConnectRequest):
     Connection verification takes approximately 8 seconds.
     """
     try:
-        mode = "monitor" if request.monitor_only else "transceive"
-        result = await ami_client.connect_node(request.node, request.monitor_only)
-        audit_log("connect", f"node={request.node} mode={mode}")
+        mode = "monitor" if body.monitor_only else "transceive"
+        result = await ami_client.connect_node(body.node, body.monitor_only)
+        audit_log("connect", f"node={body.node} mode={mode}")
 
         if not result.get("success"):
             raise HTTPException(status_code=400, detail=result.get("error"))
 
         return {
             "success": True,
-            "message": f"Connected to node {request.node} in {mode} mode",
-            "node": request.node,
+            "message": f"Connected to node {body.node} in {mode} mode",
+            "node": body.node,
             "mode": mode,
         }
     except HTTPException:
@@ -257,23 +285,24 @@ async def connect_node(request: ConnectRequest):
 
 
 @app.post("/disconnect", dependencies=[Depends(verify_api_key)], tags=["Control"])
-async def disconnect_node(request: DisconnectRequest):
+@limiter.limit(lambda: f"{config.rate_limit}/minute")
+async def disconnect_node(request: Request, body: DisconnectRequest):
     """
     Disconnect from a specific remote node.
 
     Disconnection verification takes approximately 5 seconds.
     """
     try:
-        result = await ami_client.disconnect_node(request.node)
-        audit_log("disconnect", f"node={request.node}")
+        result = await ami_client.disconnect_node(body.node)
+        audit_log("disconnect", f"node={body.node}")
 
         if not result.get("success"):
             raise HTTPException(status_code=400, detail=result.get("error"))
 
         return {
             "success": True,
-            "message": f"Disconnected from node {request.node}",
-            "node": request.node,
+            "message": f"Disconnected from node {body.node}",
+            "node": body.node,
         }
     except HTTPException:
         raise
@@ -285,7 +314,8 @@ async def disconnect_node(request: DisconnectRequest):
 @app.post(
     "/disconnect-all", dependencies=[Depends(verify_api_key)], tags=["Control"]
 )
-async def disconnect_all():
+@limiter.limit(lambda: f"{config.rate_limit}/minute")
+async def disconnect_all(request: Request):
     """Drop all active node connections."""
     try:
         await ami_client.disconnect_all()
@@ -297,7 +327,8 @@ async def disconnect_all():
 
 
 @app.post("/dtmf", dependencies=[Depends(verify_api_key)], tags=["Control"])
-async def send_dtmf(request: DTMFRequest):
+@limiter.limit(lambda: f"{config.rate_limit}/minute")
+async def send_dtmf(request: Request, body: DTMFRequest):
     """
     Send a DTMF sequence to the node.
 
@@ -306,18 +337,18 @@ async def send_dtmf(request: DTMFRequest):
 
     Valid characters: 0-9, *, #
     """
-    if not request.confirmed:
+    if not body.confirmed:
         raise HTTPException(
             status_code=400,
             detail="confirmed must be true to send DTMF",
         )
     try:
-        result = await ami_client.send_dtmf(request.sequence)
-        audit_log("dtmf", f"sequence={request.sequence}")
+        result = await ami_client.send_dtmf(body.sequence)
+        audit_log("dtmf", f"sequence={body.sequence}")
         return {
             "success": True,
-            "message": f"DTMF sequence '{request.sequence}' sent",
-            "sequence": request.sequence,
+            "message": f"DTMF sequence '{body.sequence}' sent",
+            "sequence": body.sequence,
         }
     except Exception as e:
         logger.error(f"/dtmf error: {e}")
@@ -325,7 +356,8 @@ async def send_dtmf(request: DTMFRequest):
 
 
 @app.post("/macro", dependencies=[Depends(verify_api_key)], tags=["Control"])
-async def execute_macro(request: MacroRequest):
+@limiter.limit(lambda: f"{config.rate_limit}/minute")
+async def execute_macro(request: Request, body: MacroRequest):
     """
     Execute a macro defined in rpt.conf.
 
@@ -333,12 +365,12 @@ async def execute_macro(request: MacroRequest):
     See the ASL3 documentation for macro configuration.
     """
     try:
-        result = await ami_client.execute_macro(request.macro_number)
-        audit_log("macro", f"macro_number={request.macro_number}")
+        result = await ami_client.execute_macro(body.macro_number)
+        audit_log("macro", f"macro_number={body.macro_number}")
         return {
             "success": True,
-            "message": f"Macro {request.macro_number} executed",
-            "macro_number": request.macro_number,
+            "message": f"Macro {body.macro_number} executed",
+            "macro_number": body.macro_number,
         }
     except Exception as e:
         logger.error(f"/macro error: {e}")
@@ -348,20 +380,14 @@ async def execute_macro(request: MacroRequest):
 @app.get("/lookup/{node_number}", dependencies=[Depends(verify_api_key)], tags=["Node"])
 async def lookup_node(node_number: str):
     """
-    Look up a node's callsign and location from the AllStar node database.
+    Look up a node's callsign, location, and description from the AllStar
+    node database. Served from the local cache — no external HTTP call.
 
-    Returns callsign, location, and description for any valid AllStar node
-    number. Results depend on the AllStar public API being reachable.
-    Failures return null fields rather than an error.
+    The cache is refreshed every 15 minutes from allmondb.allstarlink.org.
     """
     if not re.fullmatch(r"\d+", node_number):
         raise HTTPException(status_code=400, detail="Node number must contain only digits")
-    try:
-        result = await ami_client.lookup_node(node_number)
-        return result
-    except Exception as e:
-        logger.error(f"/lookup error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    return node_cache.lookup(node_number)
 
 
 @app.get("/audit", dependencies=[Depends(verify_api_key)], tags=["Admin"])

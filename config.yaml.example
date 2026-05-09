@@ -49,3 +49,11 @@ logging:
 # ---------------------------------------------------------------------------
 security:
   rate_limit_per_minute: 60
+
+# ---------------------------------------------------------------------------
+# Timeouts
+# Adjust if connecting to slow nodes (satellite links, intercontinental).
+# ---------------------------------------------------------------------------
+timeouts:
+  connect_max_seconds: 12    # How long to wait for a connect to be confirmed
+  disconnect_max_seconds: 8  # How long to wait for a disconnect to be confirmed

@@ -95,6 +95,35 @@ class Config:
     def rate_limit(self) -> int:
         return int(self.get("security.rate_limit_per_minute", 60))
 
+    # --- Timeouts ---
+    @property
+    def connect_timeout(self) -> int:
+        return int(self.get("timeouts.connect_max_seconds", 12))
+
+    @property
+    def disconnect_timeout(self) -> int:
+        return int(self.get("timeouts.disconnect_max_seconds", 8))
+
+    def validate(self):
+        """Validate required fields are present and non-empty. Raise on failure."""
+        errors = []
+
+        if not self.node_number:
+            errors.append("node.number is required but not set")
+        if not self.node_callsign:
+            errors.append("node.callsign is required but not set")
+        if not self.ami_password:
+            errors.append("ami.password is required but not set")
+        if not self.api_key:
+            errors.append("api.api_key is required but not set")
+
+        if errors:
+            raise ValueError(
+                "ASL3-API config validation failed:\n"
+                + "\n".join(f"  - {e}" for e in errors)
+                + f"\n\nEdit {self.config_path} and restart the service."
+            )
+
 
 # Global singleton
 config = Config()
