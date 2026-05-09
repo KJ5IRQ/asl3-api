@@ -139,7 +139,7 @@ step "Step 1: Checking prerequisites"
 
 if [ "$AUTO" = false ]; then
     explain "Before installing, we need to verify:"
-    explain "  - Python 3.9 or later is installed"
+    explain "  - Python 3.10 or later is installed"
     explain "  - Asterisk is installed and currently running"
     explain "  - We are running from the correct directory"
     pause
@@ -451,7 +451,7 @@ fi
 
 if confirm "Start ASL3-API now?" "y"; then
     sudo systemctl start "$SERVICE_NAME" || true
-    sleep 3
+    sleep 5
 
     if systemctl is-active --quiet "$SERVICE_NAME"; then
         info "ASL3-API is running"
