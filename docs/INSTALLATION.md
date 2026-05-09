@@ -9,7 +9,7 @@ This guide covers manual installation of ASL3-API. If you want the installer to 
 Before starting, confirm you have:
 
 - AllStar Link 3 installed and Asterisk running (`sudo systemctl status asterisk`)
-- Python 3.9 or later (`python3 --version`)
+- Python 3.10 or later (`python3 --version`)
 - `python3-venv` installed (`sudo apt install python3-venv` if missing)
 - sudo access on your node
 

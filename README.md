@@ -1,7 +1,7 @@
 # ASL3-API
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![ASL3](https://img.shields.io/badge/ASL-3-green.svg)](https://www.allstarlink.org/)
 
 A REST API that runs on your Raspberry Pi and gives you full HTTP control over your AllStar Link node. Connect nodes, disconnect nodes, send DTMF, execute macros, and monitor status — all via clean JSON endpoints.
@@ -47,7 +47,7 @@ Full request/response documentation is available at `http://your-pi-ip:8073/docs
 
 - AllStar Link 3 (ASL3) installed and running
 - Raspberry Pi or any Debian-based Linux system
-- Python 3.9 or later
+- Python 3.10 or later
 - sudo access for installation
 
 Tested on: ASL3 / Asterisk 22.8.2 / Debian 13 (Trixie) / Raspberry Pi 4B (aarch64)
