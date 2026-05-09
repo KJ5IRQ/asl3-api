@@ -44,7 +44,10 @@ class AMIClient:
     async def disconnect(self):
         """Close the AMI connection."""
         if self.manager:
-            await self.manager.close()
+            try:
+                await self.manager.close()
+            except TypeError:
+                pass  # panoramisk occasionally raises TypeError on close during restart
             self.connected = False
             logger.info("Disconnected from AMI")
 
