@@ -1,0 +1,30 @@
+# Secrets — never commit these
+config.yaml
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Logs
+*.log
+audit.log
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

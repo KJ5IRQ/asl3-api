@@ -1,0 +1,37 @@
+[Unit]
+Description=ASL3-API — REST API for AllStar Link node control
+Documentation=https://github.com/KJ5IRQ/ASL3-API
+After=network.target asterisk.service
+Requires=asterisk.service
+
+[Service]
+Type=simple
+
+# ---------------------------------------------------------------------------
+# User account
+# The install.sh script replaces the placeholder below with the username
+# of whoever ran the installer. Edit this manually if needed.
+# ---------------------------------------------------------------------------
+User=INSTALL_USER
+Group=INSTALL_USER
+
+WorkingDirectory=/opt/asl3-api
+ExecStart=/opt/asl3-api/venv/bin/uvicorn asl_agent:app --host 0.0.0.0 --port 8073
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# ---------------------------------------------------------------------------
+# Security hardening
+# These settings limit what the service can do if compromised.
+# ---------------------------------------------------------------------------
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/asl3-api
+ReadOnlyPaths=/etc/asterisk
+
+[Install]
+WantedBy=multi-user.target

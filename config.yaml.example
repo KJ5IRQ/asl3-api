@@ -1,0 +1,51 @@
+# ASL3-API Configuration
+# Copy this file to config.yaml and fill in your values.
+# Never commit config.yaml to git — it contains secrets.
+
+# ---------------------------------------------------------------------------
+# Asterisk Manager Interface (AMI)
+# These credentials must match the [asl3-api] section in manager.conf.
+# ---------------------------------------------------------------------------
+ami:
+  host: "127.0.0.1"      # Always localhost — AMI must not be exposed externally
+  port: 5038
+  username: "asl3-api"   # AMI user defined in /etc/asterisk/manager.conf
+  password: ""           # Generate with: openssl rand -base64 16
+
+# ---------------------------------------------------------------------------
+# Your AllStar node
+# ---------------------------------------------------------------------------
+node:
+  number: ""             # Your node number, e.g. "637050"
+  callsign: ""           # Your callsign, e.g. "KJ5IRQ"
+
+# ---------------------------------------------------------------------------
+# API server
+# ---------------------------------------------------------------------------
+api:
+  host: "0.0.0.0"        # Listen on all interfaces; restrict with firewall
+  port: 8073
+  api_key: ""            # Generate with: openssl rand -base64 32
+
+# ---------------------------------------------------------------------------
+# Webhooks (experimental — disabled by default)
+# When enabled, ASL3-API will POST JSON to the configured URL whenever
+# a node connects or disconnects. Compatible with n8n, Zapier, or any
+# HTTP endpoint that accepts POST with a JSON body.
+# ---------------------------------------------------------------------------
+webhooks:
+  enabled: false
+  url: ""                # e.g. "https://your-n8n.example.com/webhook/asl-events"
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging:
+  level: "INFO"          # DEBUG, INFO, WARNING, ERROR
+  audit_file: "/opt/asl3-api/audit.log"
+
+# ---------------------------------------------------------------------------
+# Security
+# ---------------------------------------------------------------------------
+security:
+  rate_limit_per_minute: 60
