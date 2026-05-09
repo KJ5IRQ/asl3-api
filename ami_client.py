@@ -335,7 +335,7 @@ class AMIClient:
                 continue
 
             key, _, val = line.partition(":")
-            key = key.strip()
+            key = key.strip().rstrip(".")
             val = val.strip()
 
             if not val:
