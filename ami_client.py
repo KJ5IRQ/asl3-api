@@ -88,10 +88,13 @@ class AMIClient:
     # Node status
     # ------------------------------------------------------------------
 
-    async def get_node_stats(self) -> Dict:
+    async def get_node_stats(self, include_raw: bool = False) -> Dict:
         """Return parsed statistics for the configured node."""
         response = await self.send_command(f"rpt stats {config.node_number}")
-        return self._parse_stats_response(response)
+        stats = self._parse_stats_response(response)
+        if not include_raw:
+            stats.pop("raw_output", None)
+        return stats
 
     async def get_connected_nodes(self) -> List[Dict]:
         """Return a list of nodes currently connected to this node."""

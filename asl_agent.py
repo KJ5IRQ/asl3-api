@@ -201,10 +201,13 @@ async def ping():
 
 
 @app.get("/status", dependencies=[Depends(verify_api_key)], tags=["Node"])
-async def get_status():
-    """Return node statistics: uptime, keyup count, and connected node summary."""
+async def get_status(raw: bool = False):
+    """Return node statistics: uptime, keyup count, TX time, DTMF stats.
+
+    Add ?raw=true to include the unparsed rpt stats output for debugging.
+    """
     try:
-        stats = await ami_client.get_node_stats()
+        stats = await ami_client.get_node_stats(include_raw=raw)
         audit_log("status")
         return stats
     except Exception as e:
