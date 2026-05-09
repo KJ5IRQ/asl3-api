@@ -32,6 +32,18 @@ sudo journalctl -u asl3-api -n 30 --no-pager
 
 **Common causes:**
 
+**Config validation failed:**
+```
+CRITICAL asl_agent ASL3-API config validation failed:
+  - node.number is required but not set
+  - api.api_key is required but not set
+```
+Fix: Open `/opt/asl3-api/config.yaml` and fill in the missing fields. All four of these must be set: `node.number`, `node.callsign`, `ami.password`, `api.api_key`.
+```bash
+nano /opt/asl3-api/config.yaml
+sudo systemctl restart asl3-api
+```
+
 **Config file not found:**
 ```
 FileNotFoundError: Config file not found: /opt/asl3-api/config.yaml

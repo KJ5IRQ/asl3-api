@@ -18,7 +18,7 @@
 #
 # Requirements:
 #   - ASL3 installed and Asterisk running
-#   - Python 3.9 or later
+#   - Python 3.10 or later
 #   - sudo access
 #   - Run from the directory containing the ASL3-API source files
 # =============================================================================
@@ -187,7 +187,7 @@ else
 fi
 
 # Source file check
-REQUIRED_FILES=("asl_agent.py" "ami_client.py" "config.py" "event_handler.py"
+REQUIRED_FILES=("asl_agent.py" "ami_client.py" "config.py" "event_handler.py" "node_cache.py"
                 "config.yaml.example" "requirements.txt" "asl3-api.service")
 for f in "${REQUIRED_FILES[@]}"; do
     if [ ! -f "$SCRIPT_DIR/$f" ]; then
@@ -219,6 +219,7 @@ if confirm "Create $INSTALL_DIR and install files?" "y"; then
     sudo cp "$SCRIPT_DIR/ami_client.py"      "$INSTALL_DIR/"
     sudo cp "$SCRIPT_DIR/config.py"          "$INSTALL_DIR/"
     sudo cp "$SCRIPT_DIR/event_handler.py"   "$INSTALL_DIR/"
+    sudo cp "$SCRIPT_DIR/node_cache.py"      "$INSTALL_DIR/"
     sudo cp "$SCRIPT_DIR/requirements.txt"   "$INSTALL_DIR/"
 
     # Copy example config only if config.yaml doesn't already exist

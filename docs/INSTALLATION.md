@@ -31,7 +31,7 @@ sudo mkdir -p /opt/asl3-api
 sudo chown $(whoami):$(whoami) /opt/asl3-api
 
 # Copy source files
-cp asl_agent.py ami_client.py config.py event_handler.py requirements.txt /opt/asl3-api/
+cp asl_agent.py ami_client.py config.py event_handler.py node_cache.py requirements.txt /opt/asl3-api/
 cp config.yaml.example /opt/asl3-api/
 ```
 
@@ -237,7 +237,7 @@ To upgrade to a newer version:
 ```bash
 cd ~/asl3-api          # wherever you cloned the repo
 git pull
-cp asl_agent.py ami_client.py config.py event_handler.py requirements.txt /opt/asl3-api/
+cp asl_agent.py ami_client.py config.py event_handler.py node_cache.py requirements.txt /opt/asl3-api/
 
 cd /opt/asl3-api
 source venv/bin/activate
