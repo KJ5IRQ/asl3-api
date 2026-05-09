@@ -30,8 +30,9 @@ All endpoints except `/ping` require an `X-API-Key` header.
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/ping` | Health check — no auth required |
-| GET | `/status` | Node uptime, keyup count, connection summary |
+| GET | `/status` | Node uptime, keyup count, TX time, DTMF stats |
 | GET | `/nodes` | List of currently connected nodes with mode |
+| GET | `/lookup/{node}` | Look up any node's callsign and location |
 | POST | `/connect` | Connect to a remote node (transceive or monitor) |
 | POST | `/disconnect` | Disconnect from a specific node |
 | POST | `/disconnect-all` | Drop all active connections |

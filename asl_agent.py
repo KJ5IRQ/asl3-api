@@ -75,7 +75,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="ASL3-API",
     description="REST API for AllStar Link node monitoring and control.",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -187,14 +187,16 @@ async def ping():
     """
     Lightweight health check. No authentication required.
 
-    Returns service identity and AMI connection state. Use this to verify
-    the API is reachable before polling /status or /nodes.
+    Actively verifies the AMI connection is alive on every call.
+    Use this to confirm the API is reachable and Asterisk is responding
+    before polling /status or /nodes.
     """
+    ami_ok = await ami_client.check_ami_health()
     return {
         "service": "ASL3-API",
         "node": config.node_number,
         "callsign": config.node_callsign,
-        "ami_connected": ami_client.connected,
+        "ami_connected": ami_ok,
     }
 
 
@@ -337,6 +339,25 @@ async def execute_macro(request: MacroRequest):
         }
     except Exception as e:
         logger.error(f"/macro error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/lookup/{node_number}", dependencies=[Depends(verify_api_key)], tags=["Node"])
+async def lookup_node(node_number: str):
+    """
+    Look up a node's callsign and location from the AllStar node database.
+
+    Returns callsign, location, and description for any valid AllStar node
+    number. Results depend on the AllStar public API being reachable.
+    Failures return null fields rather than an error.
+    """
+    if not re.fullmatch(r"\d+", node_number):
+        raise HTTPException(status_code=400, detail="Node number must contain only digits")
+    try:
+        result = await ami_client.lookup_node(node_number)
+        return result
+    except Exception as e:
+        logger.error(f"/lookup error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

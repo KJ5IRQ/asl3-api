@@ -7,6 +7,28 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.1.0] - 2026-05-09
+
+### Added
+
+- `GET /lookup/{node_number}` — look up any AllStar node's callsign, location, and description from the public AllStar node database
+- `check_ami_health()` — active AMI keepalive check used by `/ping`; verifies the connection is alive at call time rather than returning a stale cached boolean
+- Uptime now returned as a structured object with `raw`, `seconds` (integer), and `display` (human-readable) fields instead of a raw unparsed string
+- Additional fields now parsed from `rpt stats`: `keyups_total`, `kerchunks_today`, `kerchunks_total`, `dtmf_commands_today`, `dtmf_commands_total`, `tx_time_today`, `tx_time_total`, `last_dtmf_command`
+
+### Changed
+
+- `/connect` now polls for link confirmation every second (up to 12s) instead of waiting a hard 8-second fixed delay — fast connections return sooner
+- `/disconnect` now polls every second (up to 8s) instead of a hard 5-second wait
+- `connected_nodes` field removed from `/status` response — it was misleading (returned a raw mode-prefixed node string, not a count). Use `/nodes` for connected node data.
+- `/ping` now performs a live AMI ping on every call instead of returning a cached connection state
+
+### Fixed
+
+- Uptime parser now handles both `HH:MM:SS` and `D:HH:MM:SS` formats correctly
+
+---
+
 ## [1.0.0] - 2026-05-09
 
 Initial public release.

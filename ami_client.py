@@ -1,6 +1,7 @@
 """Asterisk Manager Interface client for ASL3-API."""
 import asyncio
 import logging
+import re
 from typing import Dict, List, Optional
 
 from panoramisk import Manager
@@ -47,6 +48,25 @@ class AMIClient:
             self.connected = False
             logger.info("Disconnected from AMI")
 
+    async def check_ami_health(self) -> bool:
+        """
+        Actively verify the AMI connection is alive by sending a ping action.
+
+        Returns True if AMI responds, False otherwise. Updates self.connected.
+        Used by /ping to provide a real-time health check rather than returning
+        a stale cached boolean.
+        """
+        if not self.manager:
+            self.connected = False
+            return False
+        try:
+            await self.manager.send_action({"Action": "Ping"})
+            self.connected = True
+            return True
+        except Exception:
+            self.connected = False
+            return False
+
     # ------------------------------------------------------------------
     # Core command execution
     # ------------------------------------------------------------------
@@ -88,42 +108,49 @@ class AMIClient:
 
         ilink mode 3 = transceive (TX+RX)
         ilink mode 2 = monitor only (RX)
+
+        Polls for connection confirmation every second up to max_wait seconds
+        rather than waiting a fixed delay, so fast connections return sooner.
         """
         ilink_mode = 2 if monitor_only else 3
         command = f"rpt cmd {config.node_number} ilink {ilink_mode} {node_number}"
         await self.send_command(command)
 
-        # AllStar needs a few seconds to establish the link
-        await asyncio.sleep(8)
+        # Poll every second up to 12 seconds for the link to appear
+        max_wait = 12
+        for _ in range(max_wait):
+            await asyncio.sleep(1)
+            nodes = await self.get_connected_nodes()
+            if any(n["node"] == node_number for n in nodes):
+                return {"success": True, "command": command, "node": node_number}
 
-        nodes = await self.get_connected_nodes()
-        connected = any(n["node"] == node_number for n in nodes)
-
-        if not connected:
-            return {
-                "success": False,
-                "error": f"Node {node_number} did not connect — it may be offline or unreachable",
-                "command": command,
-            }
-        return {"success": True, "command": command, "node": node_number}
+        return {
+            "success": False,
+            "error": f"Node {node_number} did not connect within {max_wait}s — it may be offline or unreachable",
+            "command": command,
+        }
 
     async def disconnect_node(self, node_number: str) -> Dict:
-        """Disconnect from a specific remote node. ilink mode 1 = disconnect."""
+        """
+        Disconnect from a specific remote node. ilink mode 1 = disconnect.
+
+        Polls for confirmation every second up to max_wait seconds.
+        """
         command = f"rpt cmd {config.node_number} ilink 1 {node_number}"
         await self.send_command(command)
 
-        await asyncio.sleep(5)
+        max_wait = 8
+        for _ in range(max_wait):
+            await asyncio.sleep(1)
+            nodes = await self.get_connected_nodes()
+            if not any(n["node"] == node_number for n in nodes):
+                return {"success": True, "command": command, "node": node_number}
 
-        nodes = await self.get_connected_nodes()
-        still_connected = any(n["node"] == node_number for n in nodes)
-
-        if still_connected:
-            return {
-                "success": False,
-                "error": f"Node {node_number} is still connected",
-                "command": command,
-            }
-        return {"success": True, "command": command, "node": node_number}
+        return {
+            "success": False,
+            "error": f"Node {node_number} is still connected after {max_wait}s",
+            "command": command,
+        }
 
     async def disconnect_all(self) -> Dict:
         """Drop all active node connections. ilink mode 6 = disconnect all."""
@@ -140,8 +167,8 @@ class AMIClient:
         Send a DTMF sequence to the local node.
 
         Uses 'rpt cmd <node> senddigits <sequence>'. Valid characters are
-        0-9, *, and #. The sequence is sent as-is; no validation is
-        performed here — callers should validate before invoking.
+        0-9, *, and #. The sequence is sent as-is; validation is handled
+        by the caller.
         """
         command = f"rpt cmd {config.node_number} senddigits {sequence}"
         await self.send_command(command)
@@ -164,11 +191,124 @@ class AMIClient:
         return {"success": True, "command": command, "macro_number": macro_number}
 
     # ------------------------------------------------------------------
+    # Node lookup
+    # ------------------------------------------------------------------
+
+    async def lookup_node(self, node_number: str) -> Dict:
+        """
+        Look up a node's callsign and location from the AllStar node database.
+
+        Queries the public AllStar API. Returns None values for each field
+        if the node is not found or the lookup fails. This is a best-effort
+        call — failures are logged but do not raise exceptions.
+        """
+        import aiohttp as aio
+
+        url = f"https://www.allstarlink.org/cgi-bin/node.pl?node={node_number}"
+        result = {
+            "node": node_number,
+            "callsign": None,
+            "location": None,
+            "description": None,
+        }
+
+        try:
+            async with aio.ClientSession() as session:
+                async with session.get(
+                    url, timeout=aio.ClientTimeout(total=5)
+                ) as response:
+                    if response.status != 200:
+                        logger.warning(f"Node lookup returned {response.status} for {node_number}")
+                        return result
+
+                    text = await response.text()
+
+                    # Parse the plain-text response format:
+                    # callsign|city,state|description|...
+                    # AllStar node.pl returns pipe-delimited plain text
+                    parts = text.strip().split("|")
+                    if len(parts) >= 1 and parts[0]:
+                        result["callsign"] = parts[0].strip()
+                    if len(parts) >= 2 and parts[1]:
+                        result["location"] = parts[1].strip()
+                    if len(parts) >= 3 and parts[2]:
+                        result["description"] = parts[2].strip()
+
+        except asyncio.TimeoutError:
+            logger.warning(f"Node lookup timed out for {node_number}")
+        except Exception as e:
+            logger.warning(f"Node lookup failed for {node_number}: {e}")
+
+        return result
+
+    # ------------------------------------------------------------------
     # Response parsers
     # ------------------------------------------------------------------
 
+    def _parse_uptime(self, raw: str) -> Dict:
+        """
+        Parse uptime string from 'rpt stats' into structured fields.
+
+        ASL3 formats observed:
+          HH:MM:SS          e.g. "63:47:58"
+          D:HH:MM:SS        e.g. "2:14:33:22"  (days prefix)
+
+        Returns a dict with:
+          raw       - the original string as-is
+          seconds   - total seconds as an integer (for sorting/math)
+          display   - human-readable string e.g. "2d 14h 33m 22s"
+        """
+        raw = raw.strip()
+        result = {"raw": raw, "seconds": None, "display": raw}
+
+        # Try D:HH:MM:SS first, then HH:MM:SS
+        m = re.fullmatch(r"(\d+):(\d{2}):(\d{2}):(\d{2})", raw)
+        if m:
+            days, hours, minutes, secs = (int(x) for x in m.groups())
+        else:
+            m = re.fullmatch(r"(\d+):(\d{2}):(\d{2})", raw)
+            if m:
+                days = 0
+                hours, minutes, secs = (int(x) for x in m.groups())
+            else:
+                # Unrecognised format -- return raw only
+                return result
+
+        total_seconds = days * 86400 + hours * 3600 + minutes * 60 + secs
+        result["seconds"] = total_seconds
+
+        # Build display string, omitting zero leading units
+        parts = []
+        if days:
+            parts.append(f"{days}d")
+        if hours or days:
+            parts.append(f"{hours}h")
+        if minutes or hours or days:
+            parts.append(f"{minutes}m")
+        parts.append(f"{secs}s")
+        result["display"] = " ".join(parts)
+
+        return result
+
     def _parse_stats_response(self, response: Dict) -> Dict:
-        """Parse 'rpt stats' output into a structured dict."""
+        """
+        Parse 'rpt stats' output into a structured dict.
+
+        Fields returned (all optional -- None if not found in output):
+          node                  - node number (from config)
+          callsign              - callsign (from config)
+          uptime                - structured uptime dict (raw, seconds, display)
+          keyups_today          - int
+          keyups_total          - int
+          kerchunks_today       - int
+          kerchunks_total       - int
+          dtmf_commands_today   - int
+          dtmf_commands_total   - int
+          tx_time_today         - str (raw HH:MM:SS:mmm format from ASL)
+          tx_time_total         - str
+          last_dtmf_command     - str or None
+          raw_output            - list of raw lines for debugging
+        """
         output = response.get("Output", [])
         if isinstance(output, str):
             output = [output]
@@ -176,24 +316,83 @@ class AMIClient:
         stats: Dict = {
             "node": config.node_number,
             "callsign": config.node_callsign,
+            "uptime": None,
+            "keyups_today": None,
+            "keyups_total": None,
+            "kerchunks_today": None,
+            "kerchunks_total": None,
+            "dtmf_commands_today": None,
+            "dtmf_commands_total": None,
+            "tx_time_today": None,
+            "tx_time_total": None,
+            "last_dtmf_command": None,
             "raw_output": output,
         }
 
         for line in output:
             line = line.strip()
-            if not line:
+            if not line or ":" not in line:
                 continue
 
-            # Fix: split on first colon only so "HH:MM:SS" uptime parses correctly
-            if "Uptime" in line and ":" in line:
-                stats["uptime"] = line.split(":", 1)[1].strip()
+            key, _, val = line.partition(":")
+            key = key.strip()
+            val = val.strip()
 
-            elif "Keyups today" in line and ":" in line:
-                stats["keyups_today"] = line.split(":", 1)[1].strip()
+            if not val:
+                continue
 
-            elif "Nodes currently connected" in line and ":" in line:
-                val = line.split(":", 1)[1].strip()
-                stats["connected_nodes"] = None if val == "<NONE>" else val
+            if key == "Uptime":
+                stats["uptime"] = self._parse_uptime(val)
+
+            elif key == "Keyups today":
+                try:
+                    stats["keyups_today"] = int(val)
+                except ValueError:
+                    stats["keyups_today"] = val
+
+            elif key == "Keyups since system initialization":
+                try:
+                    stats["keyups_total"] = int(val)
+                except ValueError:
+                    stats["keyups_total"] = val
+
+            elif key == "Kerchunks today":
+                try:
+                    stats["kerchunks_today"] = int(val)
+                except ValueError:
+                    stats["kerchunks_today"] = val
+
+            elif key == "Kerchunks since system initialization":
+                try:
+                    stats["kerchunks_total"] = int(val)
+                except ValueError:
+                    stats["kerchunks_total"] = val
+
+            elif key == "DTMF commands today":
+                try:
+                    stats["dtmf_commands_today"] = int(val)
+                except ValueError:
+                    stats["dtmf_commands_today"] = val
+
+            elif key == "DTMF commands since system initialization":
+                try:
+                    stats["dtmf_commands_total"] = int(val)
+                except ValueError:
+                    stats["dtmf_commands_total"] = val
+
+            elif key == "TX time today":
+                stats["tx_time_today"] = val
+
+            elif key == "TX time since system initialization":
+                stats["tx_time_total"] = val
+
+            elif key == "Last DTMF command executed":
+                stats["last_dtmf_command"] = None if val == "N/A" else val
+
+            # NOTE: "Nodes currently connected to us" is intentionally not
+            # parsed here. That field returns a raw mode-prefixed node string
+            # (e.g. "T55553") which is ambiguous and misleading. Use /nodes
+            # for accurate connected node data.
 
         return stats
 
