@@ -1,0 +1,4 @@
+#!/bin/bash
+# Fired by rpt.conf [events] when RPT_TXKEYED goes 1 -> 0 (transmitter unkeyed)
+NODE_NUMBER="__NODE_NUMBER__"
+/usr/sbin/asterisk -rx "manager userevent ASL3Event|EventName: txkeyed_false|Node: ${NODE_NUMBER}" > /dev/null 2>&1
