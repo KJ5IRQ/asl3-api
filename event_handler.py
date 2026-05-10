@@ -1,12 +1,17 @@
 """
 Event handler for ASL3-API.
 
-Monitors node connection changes by polling AMI at a configurable interval
-and optionally sends webhook notifications when nodes connect or disconnect.
+Monitors node connection changes by polling AMI every 5 seconds.
+When a change is detected, it:
+  1. Broadcasts the event to all SSE clients via ami_event_listener
+  2. Optionally POSTs a webhook notification if webhooks are enabled
 
-Webhooks are disabled by default. To enable, set webhooks.enabled = true
-in config.yaml and provide a webhooks.url endpoint that accepts POST requests
-with JSON payloads.
+Webhooks are disabled by default. To enable, set webhooks.enabled: true
+in config.yaml and provide a webhooks.url endpoint.
+
+Note: Polling is the fallback for link connect/disconnect events only.
+RX/TX keyed events are delivered via the AMI UserEvent listener which
+requires the rpt.conf [events] configuration. See INSTALLATION.md.
 """
 import asyncio
 import logging
@@ -19,17 +24,18 @@ from config import config
 
 logger = logging.getLogger(__name__)
 
-# How often to poll for node connection changes (seconds)
-POLL_INTERVAL = 30
+POLL_INTERVAL = 5  # seconds -- reduced from 30 for faster fallback detection
 
 
 class EventHandler:
-    """Poll for node connection changes and fire webhooks when enabled."""
+    """Poll for node connection changes and optionally fire webhooks."""
 
     def __init__(self, ami_client):
         self.ami_client = ami_client
         self._session: Optional[aiohttp.ClientSession] = None
         self._known_nodes: Set[str] = set()
+        # Reference to ami_event_listener set by asl_agent at startup
+        self.event_listener = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -56,11 +62,17 @@ class EventHandler:
         logger.info("Event handler stopped")
 
     # ------------------------------------------------------------------
-    # Monitoring loop (runs as background task when webhooks are enabled)
+    # Monitoring loop
     # ------------------------------------------------------------------
 
     async def monitoring_loop(self):
-        """Background task: poll for node changes every POLL_INTERVAL seconds."""
+        """
+        Background task: poll for node changes every POLL_INTERVAL seconds.
+
+        This runs regardless of webhook configuration when the event listener
+        is active. It provides fallback node connect/disconnect detection for
+        SSE clients and optionally delivers webhooks.
+        """
         logger.info(f"Node monitoring loop started (interval: {POLL_INTERVAL}s)")
         while True:
             try:
@@ -83,46 +95,57 @@ class EventHandler:
             current_nodes = await self.ami_client.get_connected_nodes()
             current_set: Set[str] = {n["node"] for n in current_nodes}
 
-            # New connections
             for node in current_set - self._known_nodes:
                 info = next(
-                    (n["info"] for n in current_nodes if n["node"] == node), ""
+                    (n for n in current_nodes if n["node"] == node), {}
                 )
-                await self._on_node_connect(node, info)
+                await self._on_node_connect(node, info.get("mode", ""))
 
-            # Dropped connections
             for node in self._known_nodes - current_set:
                 await self._on_node_disconnect(node)
 
             self._known_nodes = current_set
 
         except Exception as e:
-            logger.error(f"Node change check failed: {e}")
+            logger.debug(f"Node change check failed: {e}")
 
     # ------------------------------------------------------------------
     # Event callbacks
     # ------------------------------------------------------------------
 
-    async def _on_node_connect(self, node_number: str, info: str = ""):
-        logger.info(f"Node connected: {node_number}")
-        await self._send_webhook(
-            "node_connected",
-            {"connected_node": node_number, "info": info},
-        )
+    async def _on_node_connect(self, node_number: str, mode: str = ""):
+        logger.info(f"Node connected: {node_number} (mode={mode})")
+        # Broadcast to SSE clients if listener is wired up
+        if self.event_listener:
+            await self.event_listener.broadcast(
+                self.event_listener._make_event("link.connected", {
+                    "connected_node": node_number,
+                    "mode": mode,
+                })
+            )
+        await self._send_webhook("node_connected", {
+            "connected_node": node_number,
+            "mode": mode,
+        })
 
     async def _on_node_disconnect(self, node_number: str):
         logger.info(f"Node disconnected: {node_number}")
-        await self._send_webhook(
-            "node_disconnected",
-            {"disconnected_node": node_number},
-        )
+        if self.event_listener:
+            await self.event_listener.broadcast(
+                self.event_listener._make_event("link.disconnected", {
+                    "disconnected_node": node_number,
+                })
+            )
+        await self._send_webhook("node_disconnected", {
+            "disconnected_node": node_number,
+        })
 
     # ------------------------------------------------------------------
     # Webhook delivery
     # ------------------------------------------------------------------
 
     async def _send_webhook(self, event_type: str, data: dict):
-        """POST a webhook payload to the configured URL. Silently skips if disabled."""
+        """POST a webhook payload. Silently skips if webhooks are disabled."""
         if not config.webhooks_enabled or not self._session:
             return
 
