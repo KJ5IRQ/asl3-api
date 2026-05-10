@@ -1,3 +1,57 @@
+## [1.4.0] - 2026-05-10
+
+### Added
+
+- **SSE Event Stream** (`GET /events?api_key=KEY`) — persistent server-sent events endpoint
+  delivering live node state to browsers and apps without polling. Events emitted:
+  `node.rxkeyed`, `node.txkeyed`, `node.variables.snapshot`, `link.connected`,
+  `link.disconnected`, `health.ami`
+- **`ami_event_listener.py`** — persistent AMI UserEvent subscriber with per-client asyncio
+  broadcast queues, reconnect-with-exponential-backoff, and 5-second fallback poll loop
+- **`GET /capabilities`** — machine-readable endpoint describing node configuration,
+  available features, supported COP commands, and event types. Intended for MCP
+  auto-configuration and frontend feature detection
+- **`rpt_events/`** — four shell scripts (`asl3-event-rxkeyed-true/false`,
+  `asl3-event-txkeyed-true/false`) that bridge rpt.conf [events] triggers to AMI
+  UserEvents consumed by the SSE listener. Includes installation README
+- **Query-parameter API key** (`?api_key=`) for SSE endpoint — the browser EventSource
+  API does not support custom headers, so `/events` accepts `?api_key=` as an
+  alternative to `X-API-Key`
+- **`events:` config section** in `config.yaml` — `enabled`, `keepalive_interval`,
+  `snapshot_interval`
+- **`X-Accel-Buffering: no`** header on SSE responses — prevents nginx from buffering
+  the event stream
+
+### Changed
+
+- **`event_handler.py`** — poll interval reduced from 30s to 5s; node connect/disconnect
+  events now broadcast to SSE clients via `ami_event_listener` in addition to webhooks;
+  monitoring loop now always runs (previously gated on `webhooks_enabled`)
+- **`/nodes`** response — all fields (`callsign`, `description`, `location`) are now always
+  present in every node object regardless of `?enrich=` parameter. Missing data is `null`,
+  never absent
+- **`/lookup/{node}`** — guaranteed consistent schema; all fields always present
+- **`/audit`** — entries are now returned as structured dicts with `timestamp`, `command`,
+  `details`, and `raw` fields instead of raw text strings
+- **`/ping`** response — now includes `sse_clients` (count of connected SSE subscribers)
+- **`/version`** response — now includes `sse_clients` and `events_enabled`
+- **`manager.conf`** AMI read permissions — `user` class added to receive UserEvents
+- **Version bumped** to 1.4.0
+
+### Fixed
+
+- SSE connections no longer time out on idle proxies due to 15-second keepalive comments
+- Slow SSE clients no longer block broadcast to other clients (full queue drops the slow client)
+
+### Upgrade Notes
+
+1. Run `pip install -r requirements.txt` to install `sse-starlette`
+2. Add the `events:` block to `config.yaml` (see `config.yaml.example`)
+3. Add `user` to the `read =` line in your `manager.conf` `[asl3-api]` block and run
+   `sudo asterisk -rx "manager reload"`
+4. For live RX/TX events, install the `rpt_events/` scripts and add the `[events]` stanza
+   to `rpt.conf`. See `rpt_events/README.md`
+
 # Changelog
 
 All notable changes to ASL3-API will be documented here.
