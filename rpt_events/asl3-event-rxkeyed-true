@@ -1,0 +1,6 @@
+#!/bin/bash
+# Fired by rpt.conf [events] when RPT_RXKEYED goes 0 -> 1 (RF receiver keyed)
+# This script injects an AMI UserEvent that ASL3-API consumes for live SSE.
+# Replace NODE_NUMBER below with your actual node number.
+NODE_NUMBER="__NODE_NUMBER__"
+/usr/sbin/asterisk -rx "manager userevent ASL3Event|EventName: rxkeyed_true|Node: ${NODE_NUMBER}" > /dev/null 2>&1
