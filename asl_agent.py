@@ -1,19 +1,22 @@
 """ASL3-API - REST API for AllStar Link node control."""
 import asyncio
+import json
 import logging
 import re
 import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Optional
+from typing import AsyncIterator, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Header, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Header, Query, Request, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 from ami_client import ami_client
+from ami_event_listener import AMIEventListener
 from config import config
 from event_handler import EventHandler
 from node_cache import node_cache
@@ -29,10 +32,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Event handler
+# Global event infrastructure
 # ---------------------------------------------------------------------------
 
 event_handler = EventHandler(ami_client)
+ami_event_listener = AMIEventListener(ami_client)
 _monitoring_task: Optional[asyncio.Task] = None
 
 # ---------------------------------------------------------------------------
@@ -51,9 +55,11 @@ async def lifespan(app: FastAPI):
     except ValueError as e:
         logger.critical(str(e))
         raise
+
     await ami_client.connect()
     await event_handler.start()
     await node_cache.start()
+    await ami_event_listener.start()
 
     if config.webhooks_enabled:
         _monitoring_task = asyncio.create_task(event_handler.monitoring_loop())
@@ -74,6 +80,7 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
 
+    await ami_event_listener.stop()
     await event_handler.stop()
     await node_cache.stop()
     await ami_client.disconnect()
@@ -92,8 +99,8 @@ limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(
     title="ASL3-API",
-    description="REST API for AllStar Link node monitoring and control.",
-    version="1.3.0",
+    description="REST API for AllStar Link node monitoring, control, and live event streaming.",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -119,6 +126,28 @@ async def verify_api_key(x_api_key: str = Header(...)):
             detail="Invalid API key",
         )
     return x_api_key
+
+
+async def verify_api_key_query(api_key: str = Query(..., alias="api_key")):
+    """
+    Query-parameter API key validation for SSE endpoints.
+
+    The browser EventSource API does not support custom headers, so the
+    /events endpoint accepts ?api_key= as an alternative to X-API-Key.
+    Both are validated against the same configured secret.
+    """
+    if not config.api_key:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="API key not configured on server",
+        )
+    if api_key != config.api_key:
+        logger.warning("Rejected SSE request with invalid api_key query param")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API key",
+        )
+    return api_key
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +228,7 @@ class MacroRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Routes
+# Routes — Health
 # ---------------------------------------------------------------------------
 
 
@@ -218,6 +247,7 @@ async def ping():
         "node": config.node_number,
         "callsign": config.node_callsign,
         "ami_connected": ami_ok,
+        "sse_clients": ami_event_listener.subscriber_count,
     }
 
 
@@ -236,7 +266,14 @@ async def version():
         "callsign": config.node_callsign,
         "node_cache_size": node_cache.size,
         "node_cache_last_updated": node_cache.last_updated,
+        "sse_clients": ami_event_listener.subscriber_count,
+        "events_enabled": config.events_enabled,
     }
+
+
+# ---------------------------------------------------------------------------
+# Routes — Node
+# ---------------------------------------------------------------------------
 
 
 @app.get("/status", dependencies=[Depends(verify_api_key)], tags=["Node"])
@@ -261,11 +298,20 @@ async def get_nodes(enrich: bool = False):
 
     Add ?enrich=true to include callsign, location, and description
     for each connected node from the AllStar node database.
+
+    All response fields are always present. Fields without data are null,
+    never absent.
     """
     try:
         nodes = await ami_client.get_connected_nodes()
         if enrich:
             node_cache.enrich_node_list(nodes)
+        else:
+            # Guarantee consistent schema even without enrichment
+            for n in nodes:
+                n.setdefault("callsign", None)
+                n.setdefault("description", None)
+                n.setdefault("location", None)
         audit_log("nodes", f"{len(nodes)} connected")
         return {"connected_nodes": nodes, "count": len(nodes)}
     except Exception as e:
@@ -280,13 +326,20 @@ async def get_variables():
 
     Includes keyed state (rxkeyed), transmitter state (txkeyed),
     link counts, autopatch state, and more. Sourced directly from
-    Asterisk via AMI -- no external API calls, no caching.
+    Asterisk via AMI — no caching.
+
+    All fields are always present in the response. Fields that could
+    not be read from AMI are null, never absent.
 
     Key fields:
-      rxkeyed       - true if a signal is currently present on the node input
-      txkeyed       - true if the transmitter is currently active
-      num_links     - number of currently connected links
-      autopatch_up  - true if autopatch is active
+      rxkeyed           bool or null  - RF receiver is keyed (signal present on input)
+      txkeyed           bool or null  - Transmitter is currently active
+      ext_txkeyed       bool or null  - External TX keyed
+      num_links         int  or null  - Number of connected links
+      links             str  or null  - Raw link list string from app_rpt
+      num_active_links  int  or null  - Number of adjacent active links
+      active_links      str  or null  - Raw adjacent link list with mode/keyed state
+      autopatch_up      bool or null  - Autopatch is currently active
     """
     try:
         variables = await ami_client.get_node_variables()
@@ -296,6 +349,173 @@ async def get_variables():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/capabilities", dependencies=[Depends(verify_api_key)], tags=["Node"])
+async def get_capabilities():
+    """
+    Return the static capabilities of this node and API instance.
+
+    Provides machine-readable metadata about what this API supports,
+    what the configured node is, and what optional features are active.
+    Intended for MCP tool descriptions and client auto-configuration.
+
+    This endpoint does not query AMI — it reads config only and is safe
+    to call frequently.
+    """
+    return {
+        "node": config.node_number,
+        "callsign": config.node_callsign,
+        "api_version": app.version,
+        "features": {
+            "sse_events": config.events_enabled,
+            "webhooks": config.webhooks_enabled,
+            "node_cache": True,
+            "node_enrichment": True,
+            "dtmf": True,
+            "macros": True,
+            "cop_commands": [10, 12, 13, 14],
+        },
+        "endpoints": {
+            "events_stream": "/events?api_key=YOUR_KEY" if config.events_enabled else None,
+            "rest_docs": "/docs",
+            "redoc": "/redoc",
+        },
+        "event_types": [
+            "node.rxkeyed",
+            "node.txkeyed",
+            "node.variables.snapshot",
+            "link.connected",
+            "link.disconnected",
+            "health.ami",
+        ] if config.events_enabled else [],
+        "notes": {
+            "connect_timeout_seconds": config.connect_timeout,
+            "disconnect_timeout_seconds": config.disconnect_timeout,
+            "node_cache_refresh_seconds": 900,
+            "rate_limit_per_minute": config.rate_limit,
+        },
+    }
+
+
+@app.get("/lookup/{node_number}", dependencies=[Depends(verify_api_key)], tags=["Node"])
+async def lookup_node(node_number: str):
+    """
+    Look up a node's callsign, location, and description from the AllStar
+    node database. Served from the local cache — no external HTTP call.
+
+    All fields are always present. Fields not in the database are null.
+
+    The cache is refreshed every 15 minutes from allmondb.allstarlink.org.
+    """
+    if not re.fullmatch(r"\d+", node_number):
+        raise HTTPException(status_code=400, detail="Node number must contain only digits")
+    return node_cache.lookup(node_number)
+
+
+# ---------------------------------------------------------------------------
+# Routes — SSE Event Stream
+# ---------------------------------------------------------------------------
+
+
+@app.get("/events", tags=["Events"])
+async def event_stream(
+    request: Request,
+    api_key: str = Depends(verify_api_key_query),
+):
+    """
+    Server-Sent Events stream of live node state.
+
+    Connect with EventSource in a browser:
+        const es = new EventSource('/events?api_key=YOUR_KEY');
+        es.addEventListener('node.rxkeyed', e => console.log(JSON.parse(e.data)));
+
+    Or with curl:
+        curl -N 'http://node:8073/events?api_key=YOUR_KEY'
+
+    Events emitted (all include timestamp, node, callsign fields):
+
+      node.rxkeyed
+        rxkeyed: bool  — RF receiver keyed state changed
+        node_number: str
+
+      node.txkeyed
+        txkeyed: bool  — Transmitter keyed state changed
+        node_number: str
+
+      node.variables.snapshot
+        variables: object  — Full variable state snapshot (every 10s)
+
+      link.connected
+        connected_node: str  — Remote node just connected
+        mode: str            — T=transceive, R=receive-only
+
+      link.disconnected
+        disconnected_node: str  — Remote node just disconnected
+
+      health.ami
+        connected: bool  — AMI connection state changed
+
+    Keepalive comments are sent every 15 seconds to prevent proxy/browser
+    timeout on idle connections.
+
+    NOTE: If you are running nginx in front of this API, add
+    proxy_set_header X-Accel-Buffering no; to your location block,
+    or events will be buffered and not delivered in real time.
+    """
+    if not config.events_enabled:
+        raise HTTPException(
+            status_code=503,
+            detail="SSE events are disabled. Set events.enabled: true in config.yaml.",
+        )
+
+    queue = ami_event_listener.subscribe()
+    audit_log("events/connect", f"clients={ami_event_listener.subscriber_count}")
+
+    async def generator() -> AsyncIterator[str]:
+        # Send immediate variable snapshot on connect so client has initial state
+        try:
+            variables = await ami_client.get_node_variables()
+            snapshot = {
+                "type": "node.variables.snapshot",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "node": config.node_number,
+                "callsign": config.node_callsign,
+                "variables": variables,
+            }
+            yield f"event: node.variables.snapshot\ndata: {json.dumps(snapshot)}\n\n"
+        except Exception as e:
+            logger.warning(f"Initial snapshot failed: {e}")
+
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    event_type = event.get("type", "message")
+                    yield f"event: {event_type}\ndata: {json.dumps(event)}\n\n"
+                except asyncio.TimeoutError:
+                    # Keepalive -- prevents nginx/browser from closing idle connections
+                    yield ": keepalive\n\n"
+        finally:
+            ami_event_listener.unsubscribe(queue)
+            audit_log("events/disconnect", f"clients={ami_event_listener.subscriber_count}")
+
+    return StreamingResponse(
+        generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Routes — Control
+# ---------------------------------------------------------------------------
+
+
 @app.post("/connect", dependencies=[Depends(verify_api_key)], tags=["Control"])
 @limiter.limit(lambda: f"{config.rate_limit}/minute")
 async def connect_node(request: Request, body: ConnectRequest):
@@ -303,7 +523,7 @@ async def connect_node(request: Request, body: ConnectRequest):
     Connect to a remote AllStar node.
 
     Set monitor_only=true for receive-only (RX) mode.
-    Connection verification takes approximately 8 seconds.
+    Connection verification polls every second up to connect_timeout seconds.
     """
     try:
         mode = "monitor" if body.monitor_only else "transceive"
@@ -332,7 +552,7 @@ async def disconnect_node(request: Request, body: DisconnectRequest):
     """
     Disconnect from a specific remote node.
 
-    Disconnection verification takes approximately 5 seconds.
+    Disconnection verification polls every second up to disconnect_timeout seconds.
     """
     try:
         result = await ami_client.disconnect_node(body.node)
@@ -353,9 +573,7 @@ async def disconnect_node(request: Request, body: DisconnectRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post(
-    "/disconnect-all", dependencies=[Depends(verify_api_key)], tags=["Control"]
-)
+@app.post("/disconnect-all", dependencies=[Depends(verify_api_key)], tags=["Control"])
 @limiter.limit(lambda: f"{config.rate_limit}/minute")
 async def disconnect_all(request: Request):
     """Drop all active node connections."""
@@ -374,7 +592,7 @@ async def send_dtmf(request: Request, body: DTMFRequest):
     """
     Send a DTMF sequence to the node.
 
-    The confirmed field must be set to true. This requirement prevents
+    The confirmed field must be set to true to execute. This prevents
     accidental DTMF sends from misconfigured clients.
 
     Valid characters: 0-9, *, #
@@ -419,16 +637,17 @@ async def execute_macro(request: Request, body: MacroRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ---------------------------------------------------------------------------
+# Routes — COP Commands
+# ---------------------------------------------------------------------------
+
+
 @app.post("/cop/identify", dependencies=[Depends(verify_api_key)], tags=["Control"])
 @limiter.limit(lambda: f"{config.rate_limit}/minute")
 async def cop_identify(request: Request):
-    """
-    Play the node ID over the air. Equivalent to COP 10.
-
-    Triggers the node's configured identification announcement.
-    """
+    """Play the node ID over the air. Equivalent to COP 10."""
     try:
-        result = await ami_client.cop(10)
+        await ami_client.cop(10)
         audit_log("cop/identify")
         return {"success": True, "message": "Node ID playback triggered"}
     except Exception as e:
@@ -439,11 +658,9 @@ async def cop_identify(request: Request):
 @app.post("/cop/time", dependencies=[Depends(verify_api_key)], tags=["Control"])
 @limiter.limit(lambda: f"{config.rate_limit}/minute")
 async def cop_time(request: Request):
-    """
-    Say the current time over the air. Equivalent to COP 12.
-    """
+    """Say the current time over the air. Equivalent to COP 12."""
     try:
-        result = await ami_client.cop(12)
+        await ami_client.cop(12)
         audit_log("cop/time")
         return {"success": True, "message": "Time announcement triggered"}
     except Exception as e:
@@ -454,11 +671,9 @@ async def cop_time(request: Request):
 @app.post("/cop/status", dependencies=[Depends(verify_api_key)], tags=["Control"])
 @limiter.limit(lambda: f"{config.rate_limit}/minute")
 async def cop_status(request: Request):
-    """
-    Say the system status over the air. Equivalent to COP 13.
-    """
+    """Say the system status over the air. Equivalent to COP 13."""
     try:
-        result = await ami_client.cop(13)
+        await ami_client.cop(13)
         audit_log("cop/status")
         return {"success": True, "message": "System status announcement triggered"}
     except Exception as e:
@@ -469,11 +684,9 @@ async def cop_status(request: Request):
 @app.post("/cop/version", dependencies=[Depends(verify_api_key)], tags=["Control"])
 @limiter.limit(lambda: f"{config.rate_limit}/minute")
 async def cop_version(request: Request):
-    """
-    Say the app_rpt software version over the air. Equivalent to COP 14.
-    """
+    """Say the app_rpt software version over the air. Equivalent to COP 14."""
     try:
-        result = await ami_client.cop(14)
+        await ami_client.cop(14)
         audit_log("cop/version")
         return {"success": True, "message": "Version announcement triggered"}
     except Exception as e:
@@ -481,29 +694,40 @@ async def cop_version(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/lookup/{node_number}", dependencies=[Depends(verify_api_key)], tags=["Node"])
-async def lookup_node(node_number: str):
-    """
-    Look up a node's callsign, location, and description from the AllStar
-    node database. Served from the local cache — no external HTTP call.
-
-    The cache is refreshed every 15 minutes from allmondb.allstarlink.org.
-    """
-    if not re.fullmatch(r"\d+", node_number):
-        raise HTTPException(status_code=400, detail="Node number must contain only digits")
-    return node_cache.lookup(node_number)
+# ---------------------------------------------------------------------------
+# Routes — Admin
+# ---------------------------------------------------------------------------
 
 
 @app.get("/audit", dependencies=[Depends(verify_api_key)], tags=["Admin"])
 async def get_audit_log(lines: int = 50):
-    """Return the most recent audit log entries (default: 50)."""
+    """
+    Return the most recent audit log entries (default: 50).
+
+    Each entry is a structured dict with timestamp, command, and details
+    fields parsed from the log file. Suitable for machine consumption.
+    """
     try:
         with open(config.audit_file, "r") as f:
             all_lines = f.readlines()
         recent = all_lines[-lines:] if len(all_lines) > lines else all_lines
+
+        entries = []
+        for line in recent:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(" | ", 2)
+            entries.append({
+                "timestamp": parts[0] if len(parts) > 0 else None,
+                "command":   parts[1] if len(parts) > 1 else None,
+                "details":   parts[2] if len(parts) > 2 else None,
+                "raw":       line,
+            })
+
         return {
-            "entries": [line.strip() for line in recent],
-            "count": len(recent),
+            "entries": entries,
+            "count": len(entries),
         }
     except FileNotFoundError:
         return {"entries": [], "count": 0}
