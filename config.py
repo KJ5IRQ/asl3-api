@@ -72,6 +72,21 @@ class Config:
     def api_key(self) -> str:
         return self.get("api.api_key", "")
 
+    # --- Events (SSE) ---
+    @property
+    def events_enabled(self) -> bool:
+        return bool(self.get("events.enabled", True))
+
+    @property
+    def events_keepalive_interval(self) -> int:
+        """Seconds between SSE keepalive comments."""
+        return int(self.get("events.keepalive_interval", 15))
+
+    @property
+    def events_snapshot_interval(self) -> int:
+        """Seconds between periodic variable snapshots pushed to SSE clients."""
+        return int(self.get("events.snapshot_interval", 10))
+
     # --- Webhooks (experimental) ---
     @property
     def webhooks_enabled(self) -> bool:
