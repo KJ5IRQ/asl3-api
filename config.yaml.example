@@ -28,10 +28,24 @@ api:
   api_key: ""            # Generate with: openssl rand -base64 32
 
 # ---------------------------------------------------------------------------
+# SSE Event Stream
+# When enabled, browsers and apps can connect to GET /events?api_key=KEY
+# and receive live node state updates (RX keyed, TX keyed, link changes).
+#
+# IMPORTANT: For rxkeyed/txkeyed events to work, you must also configure
+# the rpt.conf [events] stanza on your node. See INSTALLATION.md for
+# the required shell scripts and rpt.conf additions. Without that step,
+# only link connect/disconnect events and periodic snapshots are emitted.
+# ---------------------------------------------------------------------------
+events:
+  enabled: true
+  keepalive_interval: 15   # Seconds between SSE keepalive comments (prevents proxy timeout)
+  snapshot_interval: 10    # Seconds between periodic full variable snapshots
+
+# ---------------------------------------------------------------------------
 # Webhooks (experimental — disabled by default)
-# When enabled, ASL3-API will POST JSON to the configured URL whenever
-# a node connects or disconnects. Compatible with n8n, Zapier, or any
-# HTTP endpoint that accepts POST with a JSON body.
+# When enabled, ASL3-API POSTs JSON to the configured URL whenever a node
+# connects or disconnects. Compatible with n8n, Zapier, or any HTTP endpoint.
 # ---------------------------------------------------------------------------
 webhooks:
   enabled: false
