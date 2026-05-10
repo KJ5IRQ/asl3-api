@@ -3,8 +3,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![ASL3](https://img.shields.io/badge/ASL-3-green.svg)](https://www.allstarlink.org/)
+[![Version](https://img.shields.io/badge/version-1.4.1-blue.svg)](CHANGELOG.md)
 
-A REST API that runs on your Raspberry Pi and gives you full HTTP control over your AllStar Link node. Connect nodes, disconnect nodes, send DTMF, execute macros, trigger COP commands, monitor live keyed state, and look up any node in the AllStar network — all via clean JSON endpoints.
+A REST + live event API that runs on your Raspberry Pi and gives you full HTTP control over your AllStar Link node. Connect nodes, disconnect nodes, send DTMF, execute macros, trigger COP commands, stream live keyed state in real time, and look up any node in the AllStar network — all via clean JSON endpoints.
 
 Built for ASL3 / Asterisk 22 on Debian (Raspberry Pi 4B tested).
 
@@ -14,25 +15,43 @@ Built for ASL3 / Asterisk 22 on Debian (Raspberry Pi 4B tested).
 
 AllStar Link nodes are controlled through the Asterisk Manager Interface (AMI) — a plain-text TCP protocol that is localhost-only, not documented for external use, and not friendly to consume from applications. ASL3-API wraps AMI in a FastAPI REST service that runs on your Pi alongside Asterisk. Any application that can make an HTTP request can now control your node.
 
+**v1.4 adds a live event stream.** Connect to `GET /events` and receive real-time push notifications the moment your node keys up, a link connects, or transmitter state changes — no polling required.
+
 **This is the backend.** It exposes no UI of its own. It is designed to be consumed by:
 
 - The [ASL Node Panel](https://github.com/KJ5IRQ/asl-node-panel) Chrome extension
 - curl / scripts
 - n8n, Home Assistant, or any automation platform
-- Anything else that speaks HTTP
+- MCP clients (AI agent integration — coming soon)
+- Anything else that speaks HTTP or SSE
+
+---
+
+## What Changed in v1.4
+
+Before v1.4, the only way to know your node's state was to ask. You sent a request, got a snapshot back. If your node keyed up a millisecond after your last request, you wouldn't know until you asked again.
+
+v1.4 adds a persistent event stream. Connect once and the API pushes updates to you the moment state changes — receiver keyed, transmitter keyed, link connected, link disconnected. Your frontend or automation tool stays live without hammering the API with polls.
+
+| | Before v1.4 | v1.4+ |
+|---|---|---|
+| Know when node keys | Poll `/variables` repeatedly | Subscribe to `/events`, receive `node.txkeyed` instantly |
+| Know when link connects | Poll `/nodes` every few seconds | Receive `link.connected` event automatically |
+| Browser app feel | Stale unless polling aggressively | Genuinely live |
+| AMI load | N × poll interval per client | One 1-second poll regardless of client count |
 
 ---
 
 ## Endpoints
 
-Endpoints marked **Key** require an `X-API-Key` header. Control endpoints are also rate-limited per IP (configurable, default 60/minute).
+Endpoints marked **Key** require an `X-API-Key` header. The `/events` endpoint uses `?api_key=` in the URL instead (required because browser EventSource does not support custom headers). Control endpoints are rate-limited per IP (default 60/minute, configurable).
 
 ### Health
 
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
 | GET | `/ping` | None | Live AMI health check — confirms API is up and Asterisk is responding |
-| GET | `/version` | None | Version info, Python version, node cache stats |
+| GET | `/version` | None | Version info, Python version, node cache stats, SSE client count |
 
 ### Node
 
@@ -41,7 +60,14 @@ Endpoints marked **Key** require an `X-API-Key` header. Control endpoints are al
 | GET | `/status` | Key | Node uptime, keyup count, TX time, DTMF stats. Add `?raw=true` for raw AMI output. |
 | GET | `/nodes` | Key | Connected nodes with mode (T/M/R). Add `?enrich=true` for callsign and location. |
 | GET | `/variables` | Key | Live app_rpt variables: keyed state, TX state, link count, autopatch state |
+| GET | `/capabilities` | Key | Machine-readable API and node capabilities (for MCP and client auto-configuration) |
 | GET | `/lookup/{node}` | Key | Callsign, location, description for any AllStar node. Served from local cache. |
+
+### Events (Live Stream)
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| GET | `/events` | `?api_key=` | Server-Sent Events stream — live node state push |
 
 ### Control
 
@@ -61,9 +87,65 @@ Endpoints marked **Key** require an `X-API-Key` header. Control endpoints are al
 
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
-| GET | `/audit` | Key | Recent command history |
+| GET | `/audit` | Key | Recent command history (structured JSON, not raw text) |
 
-Full interactive documentation is available at `http://your-pi-ip:8073/docs` once the service is running (FastAPI auto-generates it).
+Full interactive documentation at `http://your-pi-ip:8073/docs` once running.
+
+---
+
+## Live Event Stream
+
+Connect to `/events` and receive push notifications as things happen on your node.
+
+```bash
+# Subscribe to the live event stream
+curl -N "http://your-pi:8073/events?api_key=YOUR_KEY"
+```
+
+Sample output when a node keys up and a link connects:
+
+```
+event: node.variables.snapshot
+data: {"type": "node.variables.snapshot", "node": "637050", "callsign": "KJ5IRQ", "variables": {"rxkeyed": false, "txkeyed": false, "num_links": 0, ...}}
+
+event: node.txkeyed
+data: {"type": "node.txkeyed", "node": "637050", "callsign": "KJ5IRQ", "txkeyed": true, "timestamp": "2026-05-10T21:18:26Z"}
+
+event: node.txkeyed
+data: {"type": "node.txkeyed", "node": "637050", "callsign": "KJ5IRQ", "txkeyed": false, "timestamp": "2026-05-10T21:18:29Z"}
+
+event: link.connected
+data: {"type": "link.connected", "node": "637050", "connected_node": "55553", "mode": "T"}
+```
+
+### Event Types
+
+| Event | When it fires | Key fields |
+|-------|--------------|------------|
+| `node.variables.snapshot` | On connect + every 10s | `variables` object with full state |
+| `node.rxkeyed` | RF receiver keyed/unkeyed | `rxkeyed: bool` |
+| `node.txkeyed` | Transmitter keyed/unkeyed | `txkeyed: bool` |
+| `link.connected` | Remote node connects | `connected_node`, `mode` |
+| `link.disconnected` | Remote node disconnects | `disconnected_node` |
+| `health.ami` | AMI connection state changes | `connected: bool` |
+
+### Using EventSource in a browser
+
+```javascript
+const es = new EventSource(`http://your-pi:8073/events?api_key=${YOUR_KEY}`);
+
+es.addEventListener("node.txkeyed", e => {
+    const data = JSON.parse(e.data);
+    console.log("TX keyed:", data.txkeyed);
+});
+
+es.addEventListener("link.connected", e => {
+    const data = JSON.parse(e.data);
+    console.log("Link connected:", data.connected_node);
+});
+```
+
+> **Note for nginx users:** Add `proxy_set_header X-Accel-Buffering no;` to your location block or events will be buffered and not delivered in real time.
 
 ---
 
@@ -95,32 +177,74 @@ The installer walks you through each step, explains what it is doing, and asks f
 ./install.sh --auto
 ```
 
-Both modes produce identical results. Guided mode explains each step before running it. Auto mode skips the explanations and only prompts for your node number, callsign, and passwords.
+Both modes produce identical results. Guided mode explains each step. Auto mode only prompts for your node number, callsign, and passwords.
 
-See [docs/INSTALLATION.md](docs/INSTALLATION.md) for the full manual installation guide.
+See [docs/INSTALLATION.md](docs/INSTALLATION.md) for the full manual installation guide, including the optional rpt.conf configuration for sub-second RX/TX keyed events.
+
+---
+
+## Upgrading from v1.3.x
+
+```bash
+cd ~/asl3-api
+git pull
+
+cd /opt/asl3-api
+source venv/bin/activate
+pip install -r ~/asl3-api/requirements.txt
+deactivate
+
+cp ~/asl3-api/ami_event_listener.py    ~/asl3-api/asl_agent.py    ~/asl3-api/config.py    ~/asl3-api/event_handler.py    /opt/asl3-api/
+```
+
+Then add the `events:` block to `/opt/asl3-api/config.yaml`:
+
+```yaml
+events:
+  enabled: true
+  keepalive_interval: 15
+  snapshot_interval: 10
+```
+
+Add `user` to the read line in `/etc/asterisk/manager.conf` under your `[asl3-api]` block:
+
+```ini
+read = system,call,reporting,command,user
+```
+
+Then reload and restart:
+
+```bash
+sudo asterisk -rx "manager reload"
+sudo systemctl restart asl3-api
+```
 
 ---
 
 ## Quick Verify
 
-Once installed, confirm the service is up and AMI is connected:
-
 ```bash
 curl http://localhost:8073/ping
 ```
-
-Expected response:
 
 ```json
 {
   "service": "ASL3-API",
   "node": "637050",
   "callsign": "KJ5IRQ",
-  "ami_connected": true
+  "ami_connected": true,
+  "sse_clients": 0
 }
 ```
 
-If `ami_connected` is `false`, see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
+Then verify the event stream:
+
+```bash
+API_KEY=$(grep "api_key" /opt/asl3-api/config.yaml | awk '{print $2}' | tr -d '"')
+curl -N "http://localhost:8073/events?api_key=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$API_KEY'))")"
+```
+
+You should see an immediate `node.variables.snapshot` event. Key your radio — you should see `node.txkeyed` within 1-2 seconds.
 
 ---
 
@@ -130,55 +254,39 @@ If `ami_connected` is `false`, see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTIN
 API_KEY="your-api-key-here"
 PI="http://192.168.1.x:8073"
 
-# Health check (no auth)
+# Health (no auth)
 curl $PI/ping
 curl $PI/version
 
-# Node status
-curl -H "X-API-Key: $API_KEY" $PI/status
-curl -H "X-API-Key: $API_KEY" "$PI/status?raw=true"
+# Live event stream
+curl -N "$PI/events?api_key=$API_KEY"
 
-# Live keyed state and link info
+# Node capabilities (machine-readable)
+curl -H "X-API-Key: $API_KEY" $PI/capabilities
+
+# Node status and variables
+curl -H "X-API-Key: $API_KEY" $PI/status
 curl -H "X-API-Key: $API_KEY" $PI/variables
 
-# Connected nodes (bare)
-curl -H "X-API-Key: $API_KEY" $PI/nodes
-
-# Connected nodes with callsign and location
+# Connected nodes with enrichment
 curl -H "X-API-Key: $API_KEY" "$PI/nodes?enrich=true"
 
-# Look up any AllStar node (served from local cache, instant)
+# Look up any AllStar node
 curl -H "X-API-Key: $API_KEY" $PI/lookup/55553
-curl -H "X-API-Key: $API_KEY" $PI/lookup/674982
 
-# Connect to a node (transceive)
-curl -s -X POST -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
-  -d '{"node": "55553", "monitor_only": false}' $PI/connect
+# Connect / disconnect
+curl -s -X POST -H "X-API-Key: $API_KEY" -H "Content-Type: application/json"   -d '{"node": "55553", "monitor_only": false}' $PI/connect
 
-# Connect monitor-only
-curl -s -X POST -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
-  -d '{"node": "55553", "monitor_only": true}' $PI/connect
+curl -s -X POST -H "X-API-Key: $API_KEY" -H "Content-Type: application/json"   -d '{"node": "55553"}' $PI/disconnect
 
-# Disconnect a node
-curl -s -X POST -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
-  -d '{"node": "55553"}' $PI/disconnect
-
-# Drop all connections
 curl -s -X POST -H "X-API-Key: $API_KEY" $PI/disconnect-all
 
-# Send DTMF (confirmed must be true)
-curl -s -X POST -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
-  -d '{"sequence": "*81", "confirmed": true}' $PI/dtmf
+# DTMF (confirmed must be true)
+curl -s -X POST -H "X-API-Key: $API_KEY" -H "Content-Type: application/json"   -d '{"sequence": "*81", "confirmed": true}' $PI/dtmf
 
-# Execute a macro (must be defined in rpt.conf first)
-curl -s -X POST -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
-  -d '{"macro_number": "1"}' $PI/macro
-
-# COP commands (play over the air)
+# COP commands
 curl -s -X POST -H "X-API-Key: $API_KEY" $PI/cop/identify
 curl -s -X POST -H "X-API-Key: $API_KEY" $PI/cop/time
-curl -s -X POST -H "X-API-Key: $API_KEY" $PI/cop/status
-curl -s -X POST -H "X-API-Key: $API_KEY" $PI/cop/version
 
 # Audit log
 curl -H "X-API-Key: $API_KEY" "$PI/audit?lines=20"
@@ -188,31 +296,26 @@ curl -H "X-API-Key: $API_KEY" "$PI/audit?lines=20"
 
 ## Key Features
 
-**Node database cache** — On startup, ASL3-API fetches the AllStar node database (~40,000 nodes) and holds it in memory. `/lookup` calls are instant with no external HTTP request. The cache refreshes every 15 minutes per the official AllStar cache policy.
+**Live SSE event stream** — Subscribe to `GET /events` and receive real-time push events for keyed state, link changes, and variable snapshots. Sub-2-second latency. No polling required from clients.
 
-**Live keyed state** — `/variables` returns `rxkeyed` (signal present on node input) sourced directly from Asterisk via AMI. No external API calls, no rate limits.
+**Node database cache** — On startup, fetches the AllStar node database (~40,000 nodes) into memory. `/lookup` calls are instant. Refreshes every 15 minutes.
 
-**Rate limiting** — Control endpoints are rate-limited per IP. Default is 60 requests/minute, configurable in `config.yaml`.
+**Guaranteed response schemas** — All response fields are always present. Missing data is `null`, never absent. Consistent shapes make client code simpler.
 
-**Startup validation** — Required config fields are checked before the service binds. Clear error messages if anything is missing.
+**Rate limiting** — Control endpoints are rate-limited per IP. Default 60/minute, configurable.
 
-**Structured data** — Uptime and TX time are returned as structured objects with `raw`, `seconds` (integer), and `display` (human-readable) fields for easy client consumption.
+**Startup validation** — Required config fields checked before the service binds. Clear error messages on misconfiguration.
+
+**Structured audit log** — Every command logged with timestamp, command name, and details as structured JSON fields.
 
 ---
 
 ## Service Management
 
 ```bash
-# Check status
 sudo systemctl status asl3-api
-
-# View live logs
 sudo journalctl -u asl3-api -f
-
-# Restart after config changes
 sudo systemctl restart asl3-api
-
-# Stop
 sudo systemctl stop asl3-api
 ```
 
@@ -220,30 +323,25 @@ sudo systemctl stop asl3-api
 
 ## Configuration
 
-All configuration lives in `/opt/asl3-api/config.yaml`. The installer creates this file during setup. To change settings after installation, edit the file and restart the service.
+All configuration in `/opt/asl3-api/config.yaml`. Edit and restart to apply changes.
 
-```bash
-nano /opt/asl3-api/config.yaml
-sudo systemctl restart asl3-api
-```
-
-The `config.yaml.example` file in this repo documents every available option including timeout tuning for slow or intercontinental links.
+The `config.yaml.example` file documents every available option.
 
 ---
 
 ## Security
 
-- All control endpoints require an API key sent in the `X-API-Key` header
-- Control endpoints are rate-limited per IP (configurable)
-- AMI is bound to localhost only and cannot be accessed externally
-- The service runs as your existing node user — no new system accounts created
-- `config.yaml` is set to 600 permissions (readable only by your user)
-- The systemd service includes hardening flags: `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem`
-- Required config fields are validated on startup — misconfigured services fail fast with a clear error
+- All control endpoints require `X-API-Key` header
+- `/events` uses `?api_key=` query parameter (EventSource browser limitation)
+- AMI bound to localhost only
+- Runs as existing node user — no new system accounts
+- `config.yaml` set to 600 permissions
+- systemd hardening: `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem`
+- Config validated on startup — fails fast with clear error
 
-For remote access (outside your LAN), use Tailscale or a Cloudflare Tunnel rather than exposing port 8073 directly to the internet.
+For remote access, use Tailscale or Cloudflare Tunnel rather than exposing port 8073 directly.
 
-See [docs/SECURITY.md](docs/SECURITY.md) for full security guidance.
+See [docs/SECURITY.md](docs/SECURITY.md).
 
 ---
 
@@ -251,17 +349,11 @@ See [docs/SECURITY.md](docs/SECURITY.md) for full security guidance.
 
 | Document | Description |
 |----------|-------------|
-| [docs/INSTALLATION.md](docs/INSTALLATION.md) | Manual installation guide |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How it works under the hood |
-| [docs/SECURITY.md](docs/SECURITY.md) | Security hardening and best practices |
+| [docs/INSTALLATION.md](docs/INSTALLATION.md) | Full installation and upgrade guide |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How it works — REST, event layer, AMI |
+| [docs/SECURITY.md](docs/SECURITY.md) | Security hardening and remote access |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Common problems and fixes |
-
----
-
-## Known Issues
-
-- Node connection verification takes approximately 8-12 seconds (AllStar/Asterisk timing constraint, not an API bug). Configurable via `timeouts.connect_max_seconds` in config.yaml.
-- Webhook notifications are implemented but disabled by default pending real-world testing.
+| [CHANGELOG.md](CHANGELOG.md) | Version history |
 
 ---
 
@@ -274,19 +366,19 @@ See [docs/SECURITY.md](docs/SECURITY.md) for full security guidance.
 | Hardware | Raspberry Pi 4B (aarch64) |
 | Python | 3.13 |
 
-May work on earlier versions. ASL2 is not supported.
+ASL2 is not supported.
 
 ---
 
 ## Contributing
 
-Issues and pull requests welcome. Please open an issue before submitting a PR for anything beyond a bug fix so we can discuss the approach first.
+Issues and pull requests welcome. Open an issue before submitting a PR for anything beyond a bug fix.
 
 ---
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for details.
+MIT — see [LICENSE](LICENSE).
 
 ---
 
