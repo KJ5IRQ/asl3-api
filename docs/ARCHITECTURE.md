@@ -2,275 +2,226 @@
 
 ## Overview
 
-ASL3-API is a FastAPI application that runs on your AllStar node's Raspberry Pi. It translates HTTP REST requests into Asterisk Manager Interface (AMI) commands, executes them against the local Asterisk process, and returns structured JSON responses.
+ASL3-API is a FastAPI application that runs on your AllStar node's Raspberry Pi.
+It translates HTTP REST requests into Asterisk Manager Interface (AMI) commands,
+listens for AMI events pushed by app_rpt, and delivers live state to clients via
+Server-Sent Events (SSE).
 
 ```
-HTTP Client (browser, curl, Chrome extension, automation platform)
+Browser / App / MCP Client
         |
-        | HTTP  —  X-API-Key header  —  rate limited per IP
+        | REST (control + snapshots)     SSE (live events)
+        | X-API-Key header               ?api_key= query param
         |
 ASL3-API  (FastAPI + uvicorn, port 8073, Raspberry Pi)
         |
-        +-- node_cache.py (allmondb, refreshed every 15 min)
+        +-- node_cache.py       (allmondb, refreshed every 15 min)
+        +-- ami_event_listener  (persistent event subscriber + SSE broadcast)
+        +-- event_handler.py    (5s fallback poll, webhook delivery)
         |
-        | AMI protocol  —  port 5038, localhost only
+        | panoramisk — persistent TCP connection to port 5038
+        | Two streams on same connection:
+        |   Action/Response  (REST-triggered commands)
+        |   Unsolicited Events  (app_rpt UserEvents)
         |
-Asterisk / ASL3  (your AllStar node)
+Asterisk / ASL3  (app_rpt)
         |
-        | app_rpt ilink / cop / rpt commands
+        +-- AMI UserEvents (injected by rpt.conf [events] shell scripts)
+        |     rxkeyed_true / rxkeyed_false
+        |     txkeyed_true / txkeyed_false
+        |
+        +-- app_rpt ilink / cop / rpt commands
         |
 AllStar Link network
 ```
 
-On startup, ASL3-API also fetches the AllStar node database from `allmondb.allstarlink.org` and holds it in memory. All node lookups are served from this local cache — no per-request external HTTP calls.
+## Event Flow: How Live RX/TX State Reaches a Browser
 
----
+```
+Operator keys mic
+    |
+    RF input to node radio
+    |
+app_rpt sets RPT_RXKEYED = 1
+    |
+    rpt.conf [events] fires:
+    /usr/local/sbin/asl3-event-rxkeyed-true
+    |
+    asterisk -rx "manager userevent ASL3Event|EventName: rxkeyed_true|Node: 637050"
+    |
+AMI pushes UserEvent over TCP to panoramisk
+    |
+ami_event_listener._on_user_event() callback fires
+    |
+ami_event_listener.broadcast() puts event in every SSE client queue
+    |
+/events generator yields:
+    event: node.rxkeyed
+    data: {"type":"node.rxkeyed","rxkeyed":true,"node":"637050",...}
+    |
+Browser EventSource receives event in <100ms
+```
+
+Without the rpt.conf configuration, RX/TX state is still delivered via the
+5-second fallback poll in `ami_event_listener._fallback_poll_loop()`, but with
+up to 5 seconds of latency. The UserEvent path delivers sub-100ms.
 
 ## Components
 
 ### `asl_agent.py` — FastAPI Application
 
-The entry point and HTTP layer. Responsibilities:
+Entry point and HTTP layer. Responsibilities:
 
-- Validates required config fields on startup before binding the port
-- Connects to AMI via `ami_client` and starts the node cache
-- Validates API keys on every protected request
-- Enforces per-IP rate limits on control endpoints via `slowapi`
-- Validates all request bodies (node numbers must be numeric, DTMF must be valid characters)
+- Validates config on startup before binding the port
+- Connects to AMI, starts node cache, event listener, event handler
+- Validates API keys on every protected request (header or query param)
+- Enforces per-IP rate limits on control endpoints via slowapi
+- Validates all request bodies
 - Delegates all AMI operations to `ami_client`
-- Delegates all node lookups to `node_cache`
-- Writes timestamped entries to the audit log
-- Returns structured JSON responses
-- Starts the optional webhook monitoring loop on startup if enabled
-
-FastAPI automatically generates interactive API documentation at `/docs` (Swagger UI) and `/redoc`.
+- Delegates lookups to `node_cache`
+- Writes timestamped structured entries to the audit log
+- Streams SSE events from `ami_event_listener` to clients
 
 ### `ami_client.py` — AMI Client
 
-All communication with Asterisk goes through this module. Responsibilities:
-
-- Manages the persistent AMI connection using [panoramisk](https://github.com/gawel/panoramisk)
-- Translates REST operations into AMI commands
-- Parses AMI text responses into structured Python dicts and lists
-- Polls for link state confirmation after connect/disconnect operations
-- Provides active AMI health checking via `check_ami_health()`
-
-Key AMI commands used:
+All AMI communication. Uses panoramisk for async AMI over TCP.
 
 | Operation | AMI Command |
 |-----------|-------------|
-| Health check | `Action: Ping` |
 | Get node stats | `rpt stats {node}` |
-| Get connected nodes | `rpt nodes {node}` |
 | Get node variables | `rpt show variables {node}` |
+| Get connected nodes | `rpt nodes {node}` |
 | Connect (transceive) | `rpt cmd {node} ilink 3 {remote}` |
 | Connect (monitor) | `rpt cmd {node} ilink 2 {remote}` |
 | Disconnect one node | `rpt cmd {node} ilink 1 {remote}` |
 | Disconnect all | `rpt cmd {node} ilink 6` |
 | Send DTMF | `rpt cmd {node} senddigits {sequence}` |
 | Execute macro | `rpt cmd {node} cop 6 {macro_number}` |
-| Play node ID | `rpt cmd {node} cop 10` |
-| Say time | `rpt cmd {node} cop 12` |
-| Say system status | `rpt cmd {node} cop 13` |
-| Say app_rpt version | `rpt cmd {node} cop 14` |
+| COP command | `rpt cmd {node} cop {number}` |
+| AMI health check | `Ping` action |
 
-### `node_cache.py` — Node Database Cache
+### `ami_event_listener.py` — SSE Event Broadcaster
 
-Fetches the AllStar node description database (allmondb) on startup and refreshes it every 15 minutes in a background asyncio task. All `/lookup` calls and `/nodes?enrich=true` requests are served from this in-memory dict — no per-request HTTP calls, instant response.
+Persistent AMI subscriber and SSE fan-out. Key behaviours:
 
-The official AllStar documentation specifies a 15-minute minimum cache interval for allmondb. ASL3-API respects this exactly.
+- Registers a panoramisk callback for `UserEvent` events on startup
+- Filters for `UserEvent == ASL3Event` and `EventName` field
+- Broadcasts structured JSON to all subscribed SSE client queues
+- Each SSE client gets its own `asyncio.Queue(maxsize=200)`
+- Slow clients that fill their queue are silently dropped (does not block others)
+- Fallback poll loop runs every 5s for link connect/disconnect and variable snapshots
+- Reconnect-with-backoff if AMI connection is lost
 
-On startup the cache logs how many nodes were loaded. On a typical AllStar network this is approximately 40,000 nodes. If a refresh fails, the stale cache is retained and a warning is logged — the service continues running.
+### `event_handler.py` — Webhook Delivery + Fallback Poll
+
+Complementary to `ami_event_listener`. Runs the 5-second poll loop for node
+connect/disconnect detection and optionally delivers webhooks to external URLs.
+Also broadcasts to SSE via `ami_event_listener` to avoid duplication.
 
 ### `config.py` — Configuration
 
-Loads `config.yaml` on startup and exposes all settings as typed Python properties. Uses dot-notation getters (`config.ami_host`, `config.api_key`, etc.) so the rest of the codebase never parses YAML directly.
+Loads `config.yaml` on startup. Dot-notation property accessors. Validates
+required fields before the server binds its port.
 
-Includes a `validate()` method called during startup that checks all required fields are present and non-empty. If validation fails, the service logs a clear error and exits before binding the port.
+### `node_cache.py` — AllStar Node Database
 
-Required fields: `node.number`, `node.callsign`, `ami.password`, `api.api_key`.
+Fetches allmondb.allstarlink.org on startup, holds 39,000+ nodes in memory,
+refreshes every 15 minutes. All `/lookup` and `?enrich=true` calls are served
+from this cache -- no per-request external HTTP.
 
-### `event_handler.py` — Webhook Events (Experimental)
+## Request / Event Flows
 
-Polls for node connection changes every 30 seconds and fires HTTP POST webhooks when nodes connect or disconnect. Disabled by default (`webhooks.enabled: false` in config.yaml).
+### REST: Connect to a node
 
-When enabled, sends JSON payloads to the configured URL:
-
-```json
-{
-  "event_type": "node_connected",
-  "timestamp": "2026-05-09T12:00:00+00:00",
-  "node": "637050",
-  "callsign": "KJ5IRQ",
-  "data": {
-    "connected_node": "55553",
-    "info": ""
-  }
-}
+```
+POST /connect  {"node": "55553"}  X-API-Key: ...
+    → auth validated
+    → body validated (node must be numeric)
+    → ami_client.connect_node("55553", False)
+    → AMI: rpt cmd 637050 ilink 3 55553
+    → poll every 1s up to 12s for node to appear in rpt nodes
+    → audit log entry written
+    → {"success": true, "node": "55553", "mode": "transceive"}
 ```
 
-Compatible with n8n, Zapier, Home Assistant webhooks, or any HTTP endpoint.
+### SSE: Browser receives live keyed event
 
----
-
-## Request Flow
-
-### Example: Connect to a node
-
-1. Client sends `POST /connect` with `{"node": "55553", "monitor_only": false}` and `X-API-Key` header
-2. slowapi checks the per-IP rate limit
-3. FastAPI validates the API key
-4. Pydantic validates the request body (node must be numeric)
-5. `ami_client.connect_node("55553", False)` is called
-6. AMI command sent: `rpt cmd 637050 ilink 3 55553`
-7. Polling loop checks `rpt nodes` every second, up to `timeouts.connect_max_seconds` (default 12s)
-8. On confirmation, audit log entry written
-9. JSON response returned: `{"success": true, "node": "55553", "mode": "transceive"}`
-
-The polling wait is an AllStar/Asterisk constraint — the ilink command initiates an IAX2 connection that takes several seconds to negotiate. The timeout ceiling is configurable in `config.yaml` for slow or intercontinental links.
-
-### Example: Look up a node
-
-1. Client sends `GET /lookup/55553` with `X-API-Key` header
-2. FastAPI validates the API key
-3. `node_cache.lookup("55553")` called — instant dict lookup, no HTTP call
-4. Response returned: `{"node": "55553", "callsign": "Parrot+", "location": "Plano, TX", "description": "enhanced parrot"}`
-
-### Example: Get keyed state
-
-1. Client sends `GET /variables` with `X-API-Key` header
-2. FastAPI validates the API key
-3. `ami_client.get_node_variables()` sends `rpt show variables 637050` via AMI
-4. Response parsed: `RPT_RXKEYED`, `RPT_TXKEYED`, `RPT_NUMLINKS`, etc.
-5. Response returned with boolean and integer fields
-
----
-
-## app_rpt Variables Reference
-
-The `/variables` endpoint returns the following fields sourced from `rpt show variables`:
-
-| Variable | API field | Type | Meaning |
-|----------|-----------|------|---------|
-| `RPT_RXKEYED` | `rxkeyed` | bool | Signal present on node input (being keyed) |
-| `RPT_TXKEYED` | `txkeyed` | bool | Transmitter currently active |
-| `RPT_ETXKEYED` | `ext_txkeyed` | bool | External TX keyed |
-| `RPT_NUMLINKS` | `num_links` | int | Number of connected links |
-| `RPT_LINKS` | `links` | str\|null | Comma-separated link list |
-| `RPT_NUMALINKS` | `num_active_links` | int | Number of active links |
-| `RPT_ALINKS` | `active_links` | str\|null | Active link list |
-| `RPT_AUTOPATCHUP` | `autopatch_up` | bool | Autopatch currently active |
-
----
-
-## Connection Mode Reference
-
-AllStar ilink modes used by ASL3-API:
-
-| Mode | ilink value | Meaning |
-|------|-------------|---------|
-| Transceive | 3 | Full duplex — your node TX and RX to the remote node |
-| Monitor | 2 | Receive only — you hear the remote node but do not transmit to it |
-| Disconnect | 1 | Disconnect from a specific node |
-| Disconnect all | 6 | Drop all active links |
-
-The `rpt nodes` output prefixes each node number with a mode character:
-- `T` = transceive
-- `R` = receive only (monitor, current ASL3)
-- `M` = monitor (legacy prefix, older ASL versions)
-
----
-
-## COP Command Reference
-
-COP (Control Operator) commands confirmed on ASL3 / Asterisk 22.8.2:
-
-| COP | API Endpoint | Effect |
-|-----|-------------|--------|
-| 10 | `POST /cop/identify` | Play node ID over the air |
-| 12 | `POST /cop/time` | Say current time over the air |
-| 13 | `POST /cop/status` | Say system status over the air |
-| 14 | `POST /cop/version` | Say app_rpt software version over the air |
-
-The underlying AMI command for all COP operations is `rpt cmd {node} cop {number}`.
-
----
-
-## Data Formats
-
-### Uptime
-
-Returned by `/status` as a structured object:
-
-```json
-"uptime": {
-  "raw": "64:22:47",
-  "seconds": 231767,
-  "display": "64h 22m 47s"
-}
+```
+GET /events?api_key=...
+    → api_key validated
+    → initial variable snapshot sent immediately
+    → generator blocks on queue.get(timeout=15)
+    → operator keys mic
+    → rpt.conf fires shell script → AMI UserEvent → listener → broadcast
+    → queue.get() returns event
+    → generator yields SSE frame
+    → browser EventSource fires event listener in <100ms
 ```
 
-Handles both `HH:MM:SS` and `D:HH:MM:SS` formats from different ASL3 versions.
+## API Endpoint Summary
 
-### TX Time
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | /ping | None | Health check, AMI status |
+| GET | /version | None | Version, cache status |
+| GET | /status | Header | Node stats (uptime, keyups, TX time) |
+| GET | /nodes | Header | Connected node list |
+| GET | /variables | Header | Live app_rpt variables |
+| GET | /capabilities | Header | Node and API capabilities (MCP-friendly) |
+| GET | /lookup/{node} | Header | Node callsign/location from cache |
+| GET | /events | Query param | SSE live event stream |
+| POST | /connect | Header | Connect to remote node |
+| POST | /disconnect | Header | Disconnect specific node |
+| POST | /disconnect-all | Header | Disconnect all nodes |
+| POST | /dtmf | Header | Send DTMF sequence |
+| POST | /macro | Header | Execute rpt.conf macro |
+| POST | /cop/identify | Header | Play node ID (COP 10) |
+| POST | /cop/time | Header | Say current time (COP 12) |
+| POST | /cop/status | Header | Say system status (COP 13) |
+| POST | /cop/version | Header | Say app_rpt version (COP 14) |
+| GET | /audit | Header | Recent audit log entries (structured) |
 
-Returned by `/status` as a structured object:
+## SSE Event Reference
 
-```json
-"tx_time_today": {
-  "raw": "00:02:14:30",
-  "seconds": 134,
-  "display": "2m 14s"
-}
+All events include `type`, `timestamp` (ISO 8601 UTC), `node`, `callsign`.
+
+| Event type | Additional fields | Source |
+|-----------|-------------------|--------|
+| `node.rxkeyed` | `rxkeyed: bool`, `node_number: str` | AMI UserEvent (rpt.conf required) |
+| `node.txkeyed` | `txkeyed: bool`, `node_number: str` | AMI UserEvent (rpt.conf required) |
+| `node.variables.snapshot` | `variables: object` | Periodic poll (every 10s) |
+| `link.connected` | `connected_node: str`, `mode: str` | 5s fallback poll |
+| `link.disconnected` | `disconnected_node: str` | 5s fallback poll |
+| `health.ami` | `connected: bool` | AMI connection monitor |
+
+## manager.conf Requirements
+
+The `[asl3-api]` AMI user block must include `user` in the read class list
+for UserEvents to be delivered:
+
+```ini
+[asl3-api]
+secret = YOUR_PASSWORD
+read = system,call,reporting,command,user
+write = command,reporting
+deny = 0.0.0.0/0.0.0.0
+permit = 127.0.0.1/255.255.255.255
 ```
 
-ASL3 uses `HH:MM:SS:mmm` format (hours, minutes, seconds, milliseconds). The milliseconds field is preserved in `raw` but not included in `seconds`.
+Without `user` in the read list, the AMI connection works for REST commands
+but UserEvents are silently filtered by Asterisk and never reach the listener.
+Only the fallback 5-second poll will provide events in that case.
 
----
+## nginx Proxy Note
 
-## Security Model
+If you place nginx in front of uvicorn, add this to your location block
+to prevent SSE stream buffering:
 
-### Authentication
+```nginx
+proxy_set_header X-Accel-Buffering no;
+proxy_buffering off;
+proxy_cache off;
+```
 
-Every endpoint except `/ping` and `/version` requires an `X-API-Key` header. The key is a random 256-bit value stored in `config.yaml`. There is no session management, no token expiry, and no user accounts — one key controls the API. Rotate it periodically or immediately if compromised.
-
-### Rate Limiting
-
-Control endpoints (`/connect`, `/disconnect`, `/disconnect-all`, `/dtmf`, `/macro`, `/cop/*`) are rate-limited per source IP using `slowapi`. The default is 60 requests/minute, configurable via `security.rate_limit_per_minute` in `config.yaml`. Clients that exceed the limit receive HTTP 429.
-
-### AMI Isolation
-
-AMI is bound to `127.0.0.1:5038` by Asterisk. ASL3-API connects to it from the same machine. No external party can reach AMI directly regardless of firewall configuration.
-
-### Service Hardening
-
-The systemd service runs with:
-
-- `NoNewPrivileges=true` — cannot escalate to root
-- `PrivateTmp=true` — isolated temporary directory
-- `ProtectSystem=strict` — filesystem is read-only except for `ReadWritePaths`
-- `ProtectHome=true` — cannot access user home directories
-- `ReadWritePaths=/opt/asl3-api` — only the install directory is writable
-- `ReadOnlyPaths=/etc/asterisk` — can read Asterisk config but not modify it
-
----
-
-## Extending ASL3-API
-
-### Adding a new endpoint
-
-1. Add a method to `AMIClient` in `ami_client.py` that issues the appropriate AMI command
-2. Add a route to `asl_agent.py` with a Pydantic request model if the endpoint takes a body
-3. Apply `@limiter.limit(...)` if it is a control endpoint
-4. Add an audit log call in the route handler
-5. Update `CHANGELOG.md`
-
-### Adding webhook events
-
-1. Add a new event method to `EventHandler` in `event_handler.py`
-2. Call `_send_webhook()` with an event type string and data dict
-3. Wire it into `_check_node_changes()` or a new polling loop
-
-### Running multiple nodes
-
-ASL3-API is designed for a single node per instance. To run it against multiple nodes on the same Pi, run multiple instances on different ports with separate config files and service units.
+Without this, nginx buffers the event stream and clients may wait seconds
+or minutes before receiving events.
