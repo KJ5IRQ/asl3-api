@@ -2,13 +2,94 @@
 import asyncio
 import logging
 import re
-from typing import Dict, List, Optional
+from collections.abc import Mapping
+from typing import Any, Dict, List, Optional
 
 from panoramisk import Manager
 
 from config import config
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# AMI response normalization
+#
+# panoramisk's Manager.send_action() resolves to a panoramisk.message.Message,
+# which subclasses panoramisk.utils.CaseInsensitiveDict -> MutableMapping.
+# It is NOT a dict: isinstance(Message(...), dict) is False. Any check that
+# assumes dict silently discards the response body.
+#
+# Asterisk reports Action: Command output in two shapes, and both occur:
+#
+#   Asterisk 13+ (what ASL3 runs)
+#       Response: Success
+#       Output: <line>          <- repeated; panoramisk collapses repeated
+#       Output: <line>             headers into a list under key 'Output'
+#     -> Message['Output'] is a list[str]; Message.content is ''
+#
+#   Legacy
+#       Response: Follows
+#       <body>
+#     -> Message.content holds the body; 'Output' is absent
+#
+# An explicit failure (Response: Error / Failed) carries neither, and is
+# identified by Message.success being False.
+# ---------------------------------------------------------------------------
+
+
+def normalize_ami_output(response: Any) -> List[str]:
+    """
+    Return the output lines of an AMI Command response as a list of strings.
+
+    Accepts a panoramisk Message, any other Mapping, or a plain dict, and
+    covers both the 'Output' header and body-content shapes. Returns an empty
+    list when the response carries no output; callers must not read that as
+    either success or failure on its own.
+    """
+    chunks: List[str] = []
+
+    output = response.get("Output") if isinstance(response, Mapping) else None
+    if output is None:
+        attr = getattr(response, "Output", None)
+        output = attr if isinstance(attr, (str, list, tuple)) else None
+    if isinstance(output, str):
+        chunks.append(output)
+    elif isinstance(output, (list, tuple)):
+        chunks.extend(str(item) for item in output)
+
+    content = response.get("content") if isinstance(response, Mapping) else None
+    if not isinstance(content, str) or not content:
+        attr = getattr(response, "content", None)
+        content = attr if isinstance(attr, str) else None
+    if content:
+        chunks.append(content)
+
+    lines: List[str] = []
+    for chunk in chunks:
+        lines.extend(chunk.split("\n"))
+    return [line.rstrip("\r").strip() for line in lines if line.strip()]
+
+
+def ami_failure_detail(response: Any) -> Optional[str]:
+    """
+    Return failure text when the AMI response is an explicit failure.
+
+    panoramisk exposes Message.success, true for Response: Success / Follows /
+    Goodbye and for events. Only an explicit False counts: a plain dict has no
+    such attribute, and CaseInsensitiveDict.__getattr__ answers '' for unknown
+    attributes, neither of which is False.
+    """
+    if getattr(response, "success", None) is not False:
+        return None
+    message = response.get("Message") if isinstance(response, Mapping) else None
+    if not isinstance(message, str) or not message:
+        message = None
+    lines = normalize_ami_output(response)
+    detail = message or (" ".join(lines) if lines else "")
+    response_code = response.get("Response") if isinstance(response, Mapping) else None
+    prefix = f"AMI responded {response_code}" if response_code else "AMI reported failure"
+    return f"{prefix}: {detail}" if detail else prefix
 
 
 class CommandRejected(Exception):
@@ -225,36 +306,48 @@ class AMIClient:
     # Command acceptance
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _rejection_reason(response: Dict) -> Optional[str]:
+    #: Diagnostics app_rpt's rpt_do_cmd() writes when it refuses a command.
+    #: Source: AllStarLink/app_rpt apps/app_rpt/rpt_cli.c
+    #:   "Unknown node number %s."  node not configured on this Asterisk
+    #:   "Node %s is not ready."    node present but not initialised
+    #:   "Unknown action name %s."  no such entry in function_table
+    #:   usage text                 too few arguments for the function
+    REFUSAL_MARKERS = (
+        "Unknown node number",
+        "is not ready",
+        "Unknown action name",
+        "Usage: rpt cmd",
+    )
+
+    @classmethod
+    def _rejection_reason(cls, response: Any) -> Optional[str]:
         """
-        Return app_rpt's refusal text for an 'rpt cmd' submission, or None.
+        Return refusal text for an 'rpt cmd' submission, or None if accepted.
 
-        app_rpt's CLI handler (rpt_do_cmd, apps/app_rpt/rpt_cli.c) writes a
-        diagnostic and returns failure when it will not run a command. That
-        text comes back in the AMI Command response, so a submitted-but-refused
-        command is detectable without querying node state afterwards.
+        Two distinct kinds of refusal, checked in order:
 
-        Refusal cases:
-          "Unknown node number %s."  node not configured on this Asterisk
-          "Node %s is not ready."    node present but not initialised
-          "Unknown action name %s."  no such entry in function_table
-          usage text                 too few arguments for the function
+        1. AMI itself failed the action (Response: Error / Failed). Reported
+           regardless of body content — an explicit failure is never treated
+           as success.
+        2. AMI accepted the action, but app_rpt's CLI handler declined to run
+           the command and wrote a diagnostic. That text arrives in the Command
+           output, so a submitted-but-refused command is detectable without
+           querying node state afterwards.
+
+        Response shape handling lives in normalize_ami_output(), so this works
+        against a real panoramisk Message as well as a plain dict.
         """
-        output = response.get("Output", []) if isinstance(response, dict) else []
-        if isinstance(output, str):
-            output = [output]
-        joined = " ".join(str(line) for line in output).strip()
-        markers = (
-            "Unknown node number",
-            "is not ready",
-            "Unknown action name",
-            "Usage: rpt cmd",
-        )
-        return joined if any(m in joined for m in markers) else None
+        failure = ami_failure_detail(response)
+        if failure:
+            return failure
 
-    async def _send_checked(self, command: str) -> Dict:
-        """Send an 'rpt cmd' and raise if app_rpt explicitly refused it."""
+        joined = " ".join(normalize_ami_output(response)).strip()
+        if any(marker in joined for marker in cls.REFUSAL_MARKERS):
+            return joined
+        return None
+
+    async def _send_checked(self, command: str) -> Any:
+        """Send an 'rpt cmd' and raise if AMI or app_rpt refused it."""
         response = await self.send_command(command)
         reason = self._rejection_reason(response)
         if reason:

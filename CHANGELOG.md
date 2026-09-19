@@ -16,11 +16,21 @@ announcements. Two of them silently changed node configuration:
 | `/cop/status` | `cop 13` | Query system control state — announces `SS<n>` | `ilink 5` (Status) |
 | `/cop/version` | `cop 14` | Change system control state; no-op without an argument | `status 3` (version) |
 
-**If you ran 1.4.1 or earlier, check autopatch and link functions on your
-node.** Calling `/cop/identify` disabled autopatch and `/cop/time` disabled link
-functions, and both persist in the node's current system state. Re-enable from
-the Asterisk CLI with `cop 9` and `cop 11` respectively — this API has no
-endpoint that does so. See `docs/TROUBLESHOOTING.md`.
+**If you ran 1.4.1 or earlier, check your node before changing anything.**
+Calling `/cop/identify` disabled autopatch and `/cop/time` disabled link
+functions, and both persist in the node's currently selected system state.
+
+Establish the current state first with a read-only command —
+`asterisk -rx "rpt stats YOUR_NODE"`, or `GET /status?raw=true` — and compare
+the `Autopatch` and `User linking commands` lines against the `[controlstates]`
+entry in `rpt.conf` for the reported system state. Recovery commands (`cop 9`,
+`cop 11`) are themselves state-changing and should be issued only if that
+comparison shows a real divergence.
+
+Note that any Asterisk restart or config reload reloads the `[controlstates]`
+baseline, so a node that reads clean today may simply have been restarted since
+— a clean reading is not evidence the endpoint was never called. Full procedure
+in `docs/TROUBLESHOOTING.md`.
 
 HTTP paths are unchanged for client compatibility. The `/cop/` prefix is now a
 legacy path name only; no endpoint issues a COP command.

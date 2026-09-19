@@ -15,6 +15,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+from panoramisk.message import Message
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -80,18 +81,60 @@ def _install_stub_config():
 _install_stub_config()
 
 
+# ---------------------------------------------------------------------------
+# Panoramisk response builders
+#
+# Manager.send_action() resolves to a panoramisk.message.Message, which is a
+# CaseInsensitiveDict -> MutableMapping and NOT a dict. Tests must use real
+# Message objects: a plain dict with an "Output" key does not reproduce
+# production behaviour, and asserting against one hides type-shape bugs.
+# ---------------------------------------------------------------------------
+
+
+def command_response(*output_lines, message="Command output follows"):
+    """
+    Asterisk 13+ `Action: Command` response — what ASL3 actually returns.
+
+        Response: Success
+        Message: Command output follows
+        Output: <line>          (repeated; panoramisk collapses to a list)
+
+    Message.content is empty for this shape.
+    """
+    headers = {"Response": "Success", "Message": message}
+    if output_lines:
+        headers["Output"] = list(output_lines)
+    return Message(headers)
+
+
+def follows_response(body=""):
+    """
+    Legacy `Response: Follows` — body arrives on Message.content, no 'Output'.
+    """
+    return Message({"Response": "Follows", "Privilege": "Command"}, body)
+
+
+def error_response(message="Command not permitted", response="Error"):
+    """Explicit AMI failure. Message.success is False."""
+    return Message({"Response": response, "Message": message})
+
+
 class FakeManager:
     """
     Stand-in for panoramisk.Manager that records every AMI action.
 
     ``commands`` holds the exact Command strings submitted, which is what the
     command-correctness tests assert against.
+
+    Responses default to a real panoramisk Message so that the object type
+    under test matches production. Assign ``_response`` to another Message (or
+    a callable returning one) to simulate a specific reply.
     """
 
     def __init__(self, response=None):
         self.actions = []
         self.commands = []
-        self._response = response if response is not None else {"Output": []}
+        self._response = response if response is not None else command_response()
 
     async def send_action(self, action):
         self.actions.append(action)

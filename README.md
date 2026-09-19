@@ -94,8 +94,16 @@ Endpoints marked **Key** require an `X-API-Key` header. The `/events` endpoint u
 > clients keep working, but through 1.4.1 these endpoints really did issue COP
 > 10/12/13/14, which are *autopatch disable*, *link disable*, *query system
 > control state* and *change system control state*. `/cop/identify` disabled
-> your autopatch and `/cop/time` disabled your link functions. **If you ran
-> 1.4.1 or earlier, check both settings on your node.**
+> your autopatch and `/cop/time` disabled your link functions.
+>
+> **If you ran 1.4.1 or earlier**, read your node's current state before
+> changing anything — `asterisk -rx "rpt stats YOUR_NODE"` or
+> `GET /status?raw=true` — and compare the `Autopatch` and `User linking
+> commands` lines against the `[controlstates]` entry in `rpt.conf` for the
+> reported system state. An Asterisk restart reloads that baseline, so a node
+> reading clean today is not evidence the endpoint was never called. Step-by-step
+> procedure, including when recovery is warranted, in
+> [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 
 ### Admin
 
