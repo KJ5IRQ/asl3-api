@@ -198,26 +198,48 @@ This is normal behavior. The 8 seconds is the wait, not a timeout — the API wi
 
 ---
 
-## DTMF Endpoint Returns 400
+## DTMF or Macro Endpoint Returns 503
 
-**Symptom:** POST to `/dtmf` returns HTTP 400.
+**Symptom:** POST to `/dtmf` or `/macro` returns HTTP 503 with
+`{"detail": {"error": "capability_disabled", ...}}`.
 
-**Cause 1:** `confirmed` is not set to `true`:
-```json
-{"sequence": "#", "confirmed": true}
-```
+**This is expected on 1.4.2 and later.** Both capabilities are switched off.
 
-**Cause 2:** The sequence contains invalid characters. Only `0-9`, `*`, and `#` are accepted.
+Neither endpoint ever worked. `/dtmf` issued `rpt cmd <node> senddigits <seq>`,
+and `senddigits` is not an app_rpt function — app_rpt replied `Unknown action
+name senddigits.` `/macro` issued `rpt cmd <node> cop 6 <macro>`, and COP 6 is
+*Simulate COR being activated (phone only)*, which is ignored when the command
+comes from `rpt cmd`. Because the API never checked the AMI response, both
+returned `{"success": true}` and wrote an audit entry claiming execution.
+
+They are disabled rather than repaired because the commands that *do* work
+(`rpt fun` and the `macro` function class) execute arbitrary entries from your
+node's own `rpt.conf`, including link control and control-operator functions.
+Exposing that needs a safety design that does not exist yet.
+
+There is no workaround through this API. Use the Asterisk CLI directly if you
+need DTMF or macro execution in the meantime.
 
 ---
 
-## Macro Endpoint Has No Effect
+## Autopatch or Link Functions Stopped Working After Using the API
 
-**Symptom:** `/macro` returns `{"success": true}` but nothing happens on the node.
+**Symptom:** After calling `/cop/identify` or `/cop/time` on 1.4.1 or earlier,
+autopatch or link commands no longer respond on the node.
 
-Macros must be defined in `/etc/asterisk/rpt.conf` before they can be executed. If macro 1 is not defined, the command fires but Asterisk silently ignores it.
+**Cause:** Those endpoints issued the wrong app_rpt commands. `/cop/identify`
+issued COP 10 (*autopatch disable*) and `/cop/time` issued COP 12 (*link
+disable*). Both set persistent flags in the node's current system state.
 
-Check your rpt.conf for a `[macro]` section or `macro1=` entries. See the [ASL3 Macros documentation](https://allstarlink.github.io/adv-topics/macros/) for how to define macros.
+**Fix:** Upgrade to 1.4.2, which issues `status 1` and `status 2` instead. To
+clear the flags the old versions set, re-enable them from the Asterisk CLI:
+
+```bash
+asterisk -rx "rpt cmd YOUR_NODE cop 9"    # autopatch enable
+asterisk -rx "rpt cmd YOUR_NODE cop 11"   # link enable
+```
+
+This API has no endpoint that re-enables them.
 
 ---
 

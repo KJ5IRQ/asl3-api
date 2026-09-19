@@ -11,6 +11,21 @@ from config import config
 logger = logging.getLogger(__name__)
 
 
+class CommandRejected(Exception):
+    """
+    Raised when app_rpt accepted the AMI connection but refused the command.
+
+    Distinct from a transport failure: the API reached Asterisk, and Asterisk
+    declined to run what it was asked. Callers should surface this as an
+    upstream rejection rather than reporting success.
+    """
+
+    def __init__(self, command: str, reason: str):
+        self.command = command
+        self.reason = reason
+        super().__init__(f"app_rpt refused '{command}': {reason}")
+
+
 class AMIClient:
     """Async AMI client wrapping panoramisk. Handles connection, commands, and parsing."""
 
@@ -184,57 +199,127 @@ class AMIClient:
         return {"success": True, "command": command}
 
     # ------------------------------------------------------------------
-    # DTMF
+    # DTMF and macros
+    #
+    # Intentionally not implemented. The previous implementations issued
+    # 'rpt cmd <node> senddigits <seq>' and 'rpt cmd <node> cop 6 <macro>'.
+    # Neither is a valid way to do what it claimed:
+    #
+    #   senddigits  is not an app_rpt function at all. It does not appear in
+    #               function_table (apps/app_rpt.c), so rpt_function_lookup()
+    #               fails and app_rpt answers "Unknown action name senddigits."
+    #
+    #   cop 6       is "Simulate COR being activated (phone only)" and returns
+    #               DC_INDETERMINATE unless command_source is SOURCE_PHONE.
+    #               'rpt cmd' always sets SOURCE_RPT, so it never ran.
+    #               Macro execution is the separate 'macro' function class.
+    #
+    # Both silently did nothing while the API reported success. The correct
+    # commands ('rpt fun <node> <digits>' and 'rpt cmd <node> macro <n> <m>')
+    # execute arbitrary entries from the node's own rpt.conf, so their blast
+    # radius is configuration-dependent. They are deliberately left unbuilt
+    # until the policy-gating design lands. See docs/ARCHITECTURE.md.
     # ------------------------------------------------------------------
 
-    async def send_dtmf(self, sequence: str) -> Dict:
-        """
-        Send a DTMF sequence to the local node.
-
-        Uses 'rpt cmd <node> senddigits <sequence>'. Valid characters are
-        0-9, *, and #. The sequence is sent as-is; validation is handled
-        by the caller.
-        """
-        command = f"rpt cmd {config.node_number} senddigits {sequence}"
-        await self.send_command(command)
-        return {"success": True, "command": command, "sequence": sequence}
-
     # ------------------------------------------------------------------
-    # Macros
+    # Command acceptance
     # ------------------------------------------------------------------
 
-    async def execute_macro(self, macro_number: str) -> Dict:
+    @staticmethod
+    def _rejection_reason(response: Dict) -> Optional[str]:
         """
-        Execute a macro defined in rpt.conf.
+        Return app_rpt's refusal text for an 'rpt cmd' submission, or None.
 
-        Macros are triggered via DTMF using the *D prefix, e.g. *D1 runs
-        macro 1. This method sends the equivalent command directly via AMI
-        without requiring an over-the-air DTMF transmission.
+        app_rpt's CLI handler (rpt_do_cmd, apps/app_rpt/rpt_cli.c) writes a
+        diagnostic and returns failure when it will not run a command. That
+        text comes back in the AMI Command response, so a submitted-but-refused
+        command is detectable without querying node state afterwards.
+
+        Refusal cases:
+          "Unknown node number %s."  node not configured on this Asterisk
+          "Node %s is not ready."    node present but not initialised
+          "Unknown action name %s."  no such entry in function_table
+          usage text                 too few arguments for the function
         """
-        command = f"rpt cmd {config.node_number} cop 6 {macro_number}"
-        await self.send_command(command)
-        return {"success": True, "command": command, "macro_number": macro_number}
+        output = response.get("Output", []) if isinstance(response, dict) else []
+        if isinstance(output, str):
+            output = [output]
+        joined = " ".join(str(line) for line in output).strip()
+        markers = (
+            "Unknown node number",
+            "is not ready",
+            "Unknown action name",
+            "Usage: rpt cmd",
+        )
+        return joined if any(m in joined for m in markers) else None
+
+    async def _send_checked(self, command: str) -> Dict:
+        """Send an 'rpt cmd' and raise if app_rpt explicitly refused it."""
+        response = await self.send_command(command)
+        reason = self._rejection_reason(response)
+        if reason:
+            logger.error(f"app_rpt refused [{command}]: {reason}")
+            raise CommandRejected(command, reason)
+        return response
 
     # ------------------------------------------------------------------
-    # COP (Control Operator) commands
+    # Announcements (over-the-air telemetry)
+    #
+    # Command numbers below are verified against AllStarLink/app_rpt,
+    # apps/app_rpt/rpt_functions.c. Do not change them without re-reading
+    # function_status() and function_ilink() — the COP numbers previously
+    # used here were control-operator state changes, not announcements.
     # ------------------------------------------------------------------
 
-    async def cop(self, cop_number: int) -> Dict:
+    async def force_id(self) -> Dict:
         """
-        Execute a COP (Control Operator) command.
+        Force the node to identify over the air.
 
-        COP commands confirmed on ASL3:
-          10 - Play node ID
-          12 - Say current time
-          13 - Say system status
-          14 - Say app_rpt software version
-
-        Note: rpt showvars is not a valid ASL3 command.
-        Use get_node_variables() instead.
+        app_rpt: status 1 — function_status case 1, "System ID".
+        Default DTMF equivalent: *80.
         """
-        command = f"rpt cmd {config.node_number} cop {cop_number}"
-        await self.send_command(command)
-        return {"success": True, "command": command, "cop": cop_number}
+        command = f"rpt cmd {config.node_number} status 1"
+        await self._send_checked(command)
+        return {"success": True, "command": command}
+
+    async def say_time(self) -> Dict:
+        """
+        Announce the current time over the air.
+
+        app_rpt: status 2 — function_status case 2, "System Time".
+        Default DTMF equivalent: *81.
+        """
+        command = f"rpt cmd {config.node_number} status 2"
+        await self._send_checked(command)
+        return {"success": True, "command": command}
+
+    async def say_version(self) -> Dict:
+        """
+        Announce the app_rpt software version over the air.
+
+        app_rpt: status 3 — function_status case 3, "app_rpt.c version".
+        Default DTMF equivalent: *980.
+        """
+        command = f"rpt cmd {config.node_number} status 3"
+        await self._send_checked(command)
+        return {"success": True, "command": command}
+
+    async def say_status(self) -> Dict:
+        """
+        Announce system/connection status over the air.
+
+        app_rpt: ilink 5 — function_ilink case 5, "Status", which emits STATUS
+        telemetry. app_rpt labels its local-only counterpart (status 13) as
+        "Local System status (ILINK, 5)", confirming ilink 5 is the system
+        status announcement.
+
+        ilink 15 ("Full Status", FULLSTATUS) enumerates every connected node
+        and produces a longer transmission. This endpoint's documented contract
+        is "say the system status", so the shorter form is used.
+        """
+        command = f"rpt cmd {config.node_number} ilink 5"
+        await self._send_checked(command)
+        return {"success": True, "command": command}
 
     # ------------------------------------------------------------------
     # Response parsers

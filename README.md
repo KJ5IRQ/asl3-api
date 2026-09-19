@@ -76,12 +76,26 @@ Endpoints marked **Key** require an `X-API-Key` header. The `/events` endpoint u
 | POST | `/connect` | Key | Connect to a remote node (transceive or monitor-only) |
 | POST | `/disconnect` | Key | Disconnect from a specific node |
 | POST | `/disconnect-all` | Key | Drop all active connections |
-| POST | `/dtmf` | Key | Send a DTMF sequence to your node |
-| POST | `/macro` | Key | Execute a macro defined in rpt.conf |
-| POST | `/cop/identify` | Key | Play node ID over the air (COP 10) |
-| POST | `/cop/time` | Key | Say current time over the air (COP 12) |
-| POST | `/cop/status` | Key | Say system status over the air (COP 13) |
-| POST | `/cop/version` | Key | Say app_rpt version over the air (COP 14) |
+| POST | `/dtmf` | Key | **Disabled since 1.4.2** — returns 503, sends nothing |
+| POST | `/macro` | Key | **Disabled since 1.4.2** — returns 503, sends nothing |
+| POST | `/cop/identify` | Key | Force node ID over the air (`status 1`) |
+| POST | `/cop/time` | Key | Say current time over the air (`status 2`) |
+| POST | `/cop/status` | Key | Say system status over the air (`ilink 5`) |
+| POST | `/cop/version` | Key | Say app_rpt version over the air (`status 3`) |
+
+> **DTMF and macro sending are unavailable.** Both endpoints were broken in every
+> release up to and including 1.4.1: they issued app_rpt commands that either do
+> not exist or cannot run from this context, and reported success anyway. Rather
+> than switch them to the working commands — whose effects depend entirely on
+> your node's `rpt.conf` — they now fail explicitly with HTTP 503 while a safety
+> design is worked out. See [CHANGELOG](CHANGELOG.md).
+
+> **The `/cop/*` paths are not COP commands.** The prefix is kept so existing
+> clients keep working, but through 1.4.1 these endpoints really did issue COP
+> 10/12/13/14, which are *autopatch disable*, *link disable*, *query system
+> control state* and *change system control state*. `/cop/identify` disabled
+> your autopatch and `/cop/time` disabled your link functions. **If you ran
+> 1.4.1 or earlier, check both settings on your node.**
 
 ### Admin
 
@@ -281,12 +295,14 @@ curl -s -X POST -H "X-API-Key: $API_KEY" -H "Content-Type: application/json"   -
 
 curl -s -X POST -H "X-API-Key: $API_KEY" $PI/disconnect-all
 
-# DTMF (confirmed must be true)
-curl -s -X POST -H "X-API-Key: $API_KEY" -H "Content-Type: application/json"   -d '{"sequence": "*81", "confirmed": true}' $PI/dtmf
+# Announcements (over the air)
+curl -s -X POST -H "X-API-Key: $API_KEY" $PI/cop/identify   # force ID
+curl -s -X POST -H "X-API-Key: $API_KEY" $PI/cop/time       # say the time
+curl -s -X POST -H "X-API-Key: $API_KEY" $PI/cop/status     # say link status
+curl -s -X POST -H "X-API-Key: $API_KEY" $PI/cop/version    # say app_rpt version
 
-# COP commands
-curl -s -X POST -H "X-API-Key: $API_KEY" $PI/cop/identify
-curl -s -X POST -H "X-API-Key: $API_KEY" $PI/cop/time
+# DTMF and macros are disabled since 1.4.2 — these return HTTP 503
+# and send nothing to the node.
 
 # Audit log
 curl -H "X-API-Key: $API_KEY" "$PI/audit?lines=20"

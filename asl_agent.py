@@ -15,7 +15,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from ami_client import ami_client
+from ami_client import CommandRejected, ami_client
 from ami_event_listener import AMIEventListener
 from config import config
 from event_handler import EventHandler
@@ -100,7 +100,7 @@ limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(
     title="ASL3-API",
     description="REST API for AllStar Link node monitoring, control, and live event streaming.",
-    version="1.4.0",
+    version="1.4.2",
     lifespan=lifespan,
 )
 
@@ -370,9 +370,21 @@ async def get_capabilities():
             "webhooks": config.webhooks_enabled,
             "node_cache": True,
             "node_enrichment": True,
-            "dtmf": True,
-            "macros": True,
-            "cop_commands": [10, 12, 13, 14],
+            "dtmf": False,
+            "macros": False,
+            "announcements": ["identify", "time", "status", "version"],
+        },
+        "unavailable": {
+            "dtmf": (
+                "Disabled since 1.4.2 pending safety redesign. The prior "
+                "implementation issued an invalid app_rpt command and never "
+                "executed. POST /dtmf returns 503."
+            ),
+            "macros": (
+                "Disabled since 1.4.2 pending safety redesign. The prior "
+                "implementation issued a command app_rpt ignored and never "
+                "executed. POST /macro returns 503."
+            ),
         },
         "endpoints": {
             "events_stream": "/events?api_key=YOUR_KEY" if config.events_enabled else None,
@@ -586,70 +598,105 @@ async def disconnect_all(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _capability_disabled(capability: str, detail: str, attempt: str) -> HTTPException:
+    """
+    Build the 503 returned by a capability withdrawn pending safety redesign.
+
+    Records the refused attempt in the audit log. The audit entry is explicitly
+    marked as rejected so the log never implies the node acted on the request.
+    """
+    audit_log(f"{capability}/rejected", f"{attempt} reason=capability_disabled")
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail={
+            "error": "capability_disabled",
+            "capability": capability,
+            "message": detail,
+            "executed": False,
+            "since_version": "1.4.2",
+        },
+    )
+
+
 @app.post("/dtmf", dependencies=[Depends(verify_api_key)], tags=["Control"])
 @limiter.limit(lambda: f"{config.rate_limit}/minute")
 async def send_dtmf(request: Request, body: DTMFRequest):
     """
-    Send a DTMF sequence to the node.
+    Disabled since 1.4.2. Always returns 503 and sends nothing to the node.
 
-    The confirmed field must be set to true to execute. This prevents
-    accidental DTMF sends from misconfigured clients.
+    This endpoint never worked. It issued 'rpt cmd <node> senddigits <seq>',
+    and 'senddigits' is not an app_rpt function — app_rpt answered "Unknown
+    action name senddigits." while this API reported success and wrote an
+    audit entry claiming the digits were sent.
 
-    Valid characters: 0-9, *, #
+    It is not being repaired in place. The working equivalent, 'rpt fun',
+    injects digits into the node's own DTMF function decoder, so its effect is
+    whatever that node's rpt.conf [functions] stanza defines — potentially
+    including link control and control-operator state changes. That needs the
+    policy gating designed in the architecture review before it is exposed.
     """
-    if not body.confirmed:
-        raise HTTPException(
-            status_code=400,
-            detail="confirmed must be true to send DTMF",
-        )
-    try:
-        result = await ami_client.send_dtmf(body.sequence)
-        audit_log("dtmf", f"sequence={body.sequence}")
-        return {
-            "success": True,
-            "message": f"DTMF sequence '{body.sequence}' sent",
-            "sequence": body.sequence,
-        }
-    except Exception as e:
-        logger.error(f"/dtmf error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    raise _capability_disabled(
+        "dtmf",
+        "DTMF sending is disabled pending a safety redesign. The previous "
+        "implementation issued an invalid app_rpt command and never executed, "
+        "despite reporting success. No digits were sent.",
+        f"sequence={body.sequence}",
+    )
 
 
 @app.post("/macro", dependencies=[Depends(verify_api_key)], tags=["Control"])
 @limiter.limit(lambda: f"{config.rate_limit}/minute")
 async def execute_macro(request: Request, body: MacroRequest):
     """
-    Execute a macro defined in rpt.conf.
+    Disabled since 1.4.2. Always returns 503 and sends nothing to the node.
 
-    Macros must be defined in your node's rpt.conf before use.
-    See the ASL3 documentation for macro configuration.
+    This endpoint never worked. It issued 'rpt cmd <node> cop 6 <macro>'.
+    COP 6 is "Simulate COR being activated (phone only)" and returns
+    DC_INDETERMINATE for any command source other than SOURCE_PHONE; 'rpt cmd'
+    always uses SOURCE_RPT. No macro was ever executed, yet this API reported
+    success and wrote an audit entry claiming it had run.
+
+    Macro execution is the separate 'macro' function class. A macro expands to
+    an arbitrary DTMF string from the node's rpt.conf [macro] stanza, so its
+    effect is unbounded from this API's perspective. It stays disabled until
+    policy gating exists.
     """
-    try:
-        result = await ami_client.execute_macro(body.macro_number)
-        audit_log("macro", f"macro_number={body.macro_number}")
-        return {
-            "success": True,
-            "message": f"Macro {body.macro_number} executed",
-            "macro_number": body.macro_number,
-        }
-    except Exception as e:
-        logger.error(f"/macro error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    raise _capability_disabled(
+        "macros",
+        "Macro execution is disabled pending a safety redesign. The previous "
+        "implementation issued a command that app_rpt ignored, despite "
+        "reporting success. No macro was executed.",
+        f"macro_number={body.macro_number}",
+    )
 
 
 # ---------------------------------------------------------------------------
-# Routes — COP Commands
+# Routes — Announcements
+#
+# HTTP paths keep their /cop/ prefix for client compatibility, but none of
+# these are COP (control operator) commands. Through 1.4.1 they issued COP
+# 10/12/13/14, which are autopatch disable, link disable, query system control
+# state and change system control state — not announcements. /cop/identify
+# silently disabled autopatch and /cop/time silently disabled link functions.
+# They now issue the app_rpt commands that match what the endpoints document.
 # ---------------------------------------------------------------------------
 
 
 @app.post("/cop/identify", dependencies=[Depends(verify_api_key)], tags=["Control"])
 @limiter.limit(lambda: f"{config.rate_limit}/minute")
 async def cop_identify(request: Request):
-    """Play the node ID over the air. Equivalent to COP 10."""
+    """
+    Force the node to identify over the air. app_rpt: status 1.
+
+    Fixed in 1.4.2. Previously issued COP 10, which disables autopatch.
+    """
     try:
-        await ami_client.cop(10)
-        audit_log("cop/identify")
+        result = await ami_client.force_id()
+        audit_log("cop/identify", f"command={result['command']}")
         return {"success": True, "message": "Node ID playback triggered"}
+    except CommandRejected as e:
+        logger.error(f"/cop/identify rejected: {e}")
+        raise HTTPException(status_code=502, detail=str(e))
     except Exception as e:
         logger.error(f"/cop/identify error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -658,11 +705,18 @@ async def cop_identify(request: Request):
 @app.post("/cop/time", dependencies=[Depends(verify_api_key)], tags=["Control"])
 @limiter.limit(lambda: f"{config.rate_limit}/minute")
 async def cop_time(request: Request):
-    """Say the current time over the air. Equivalent to COP 12."""
+    """
+    Announce the current time over the air. app_rpt: status 2.
+
+    Fixed in 1.4.2. Previously issued COP 12, which disables link functions.
+    """
     try:
-        await ami_client.cop(12)
-        audit_log("cop/time")
+        result = await ami_client.say_time()
+        audit_log("cop/time", f"command={result['command']}")
         return {"success": True, "message": "Time announcement triggered"}
+    except CommandRejected as e:
+        logger.error(f"/cop/time rejected: {e}")
+        raise HTTPException(status_code=502, detail=str(e))
     except Exception as e:
         logger.error(f"/cop/time error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -671,11 +725,19 @@ async def cop_time(request: Request):
 @app.post("/cop/status", dependencies=[Depends(verify_api_key)], tags=["Control"])
 @limiter.limit(lambda: f"{config.rate_limit}/minute")
 async def cop_status(request: Request):
-    """Say the system status over the air. Equivalent to COP 13."""
+    """
+    Announce system/connection status over the air. app_rpt: ilink 5.
+
+    Fixed in 1.4.2. Previously issued COP 13, which announces the system
+    control state rather than connection status.
+    """
     try:
-        await ami_client.cop(13)
-        audit_log("cop/status")
+        result = await ami_client.say_status()
+        audit_log("cop/status", f"command={result['command']}")
         return {"success": True, "message": "System status announcement triggered"}
+    except CommandRejected as e:
+        logger.error(f"/cop/status rejected: {e}")
+        raise HTTPException(status_code=502, detail=str(e))
     except Exception as e:
         logger.error(f"/cop/status error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -684,11 +746,19 @@ async def cop_status(request: Request):
 @app.post("/cop/version", dependencies=[Depends(verify_api_key)], tags=["Control"])
 @limiter.limit(lambda: f"{config.rate_limit}/minute")
 async def cop_version(request: Request):
-    """Say the app_rpt software version over the air. Equivalent to COP 14."""
+    """
+    Announce the app_rpt software version over the air. app_rpt: status 3.
+
+    Fixed in 1.4.2. Previously issued COP 14 with no argument, which changes
+    the system control state when given one and did nothing without one.
+    """
     try:
-        await ami_client.cop(14)
-        audit_log("cop/version")
+        result = await ami_client.say_version()
+        audit_log("cop/version", f"command={result['command']}")
         return {"success": True, "message": "Version announcement triggered"}
+    except CommandRejected as e:
+        logger.error(f"/cop/version rejected: {e}")
+        raise HTTPException(status_code=502, detail=str(e))
     except Exception as e:
         logger.error(f"/cop/version error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
