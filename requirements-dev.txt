@@ -1,0 +1,20 @@
+# Development and test dependencies for ASL3-API.
+#
+# Usage (installs the runtime requirements too):
+#     pip install -r requirements-dev.txt
+#
+# Pinned exactly, matching the style of requirements.txt, so that CI and a
+# developer checkout resolve to the same versions.
+
+-r requirements.txt
+
+# Test runner.
+pytest==9.1.1
+
+# Required by fastapi.testclient.TestClient, which the endpoint tests use.
+# Not a runtime dependency — the service itself never imports httpx.
+httpx==0.28.1
+
+# Linter. CI runs `ruff check tests/` only; the application modules carry
+# pre-existing style debt that is out of scope for the safety hotfix.
+ruff==0.16.8
