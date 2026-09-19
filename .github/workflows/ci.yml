@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 is the floor install.sh enforces and the floor of the dependency
+        # stack (fastapi, starlette, pytest and anyio are all >=3.10).
+        # 3.13 is Debian 13 (Trixie), the documented and tested ASL3 platform.
+        # 3.11 and 3.12 sit between the two and are covered by implication.
+        python-version: ["3.10", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install runtime dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install test dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Test
+        run: pytest tests/ -q
+
+      - name: Lint tests
+        run: ruff check tests/

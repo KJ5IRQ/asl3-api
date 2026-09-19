@@ -1,3 +1,89 @@
+## [1.4.2] - 2026-09-19
+
+Safety hotfix. Corrects control commands that were verified wrong against
+current `AllStarLink/app_rpt` source (`apps/app_rpt/rpt_functions.c`,
+`apps/app_rpt/rpt_cli.c`).
+
+### Fixed — announcement endpoints issued the wrong app_rpt commands
+
+All four `/cop/*` endpoints were issuing control-operator commands instead of
+announcements. Two of them silently changed node configuration:
+
+| Endpoint | Issued (≤1.4.1) | What that actually does | Now issues |
+|----------|-----------------|-------------------------|------------|
+| `/cop/identify` | `cop 10` | **Autopatch disable** — sets `autopatchdisable = 1` | `status 1` (System ID) |
+| `/cop/time` | `cop 12` | **Link disable** — sets `linkfundisable = 1` | `status 2` (System Time) |
+| `/cop/status` | `cop 13` | Query system control state — announces `SS<n>` | `ilink 5` (Status) |
+| `/cop/version` | `cop 14` | Change system control state; no-op without an argument | `status 3` (version) |
+
+**If you ran 1.4.1 or earlier, check your node before changing anything.**
+Calling `/cop/identify` disabled autopatch and `/cop/time` disabled link
+functions, and both persist in the node's currently selected system state.
+
+Establish the current state first with a read-only command —
+`asterisk -rx "rpt stats YOUR_NODE"`, or `GET /status?raw=true` — and compare
+the `Autopatch` and `User linking commands` lines against the `[controlstates]`
+entry in `rpt.conf` for the reported system state. Recovery commands (`cop 9`,
+`cop 11`) are themselves state-changing and should be issued only if that
+comparison shows a real divergence.
+
+Note that any Asterisk restart or config reload reloads the `[controlstates]`
+baseline, so a node that reads clean today may simply have been restarted since
+— a clean reading is not evidence the endpoint was never called. Full procedure
+in `docs/TROUBLESHOOTING.md`.
+
+HTTP paths are unchanged for client compatibility. The `/cop/` prefix is now a
+legacy path name only; no endpoint issues a COP command.
+
+### Changed — DTMF and macro execution disabled (HTTP 503)
+
+Neither ever worked, and both reported success anyway:
+
+- `/dtmf` issued `rpt cmd <node> senddigits <seq>`. `senddigits` is not in
+  app_rpt's `function_table`, so `rpt_function_lookup()` fails and app_rpt
+  answers `Unknown action name senddigits.`
+- `/macro` issued `rpt cmd <node> cop 6 <macro>`. COP 6 is *Simulate COR being
+  activated (phone only)* and returns `DC_INDETERMINATE` unless the command
+  source is `SOURCE_PHONE`; `rpt cmd` always uses `SOURCE_RPT`.
+
+`ami_client` never inspected the AMI response, so both returned
+`{"success": true}` and wrote an audit entry claiming execution.
+
+They are **not** repaired in place. The commands that work (`rpt fun` and the
+`macro` function class) execute arbitrary entries from the node's own
+`rpt.conf`, so their effect is unbounded from this API's perspective. Both
+endpoints now return HTTP 503 with a structured `capability_disabled` body,
+issue no AMI command, and write an audit entry marked `rejected`. The routes are
+retained so existing clients get a clear error rather than a 404.
+
+### Added
+
+- `CommandRejected` exception. Announcement endpoints now detect app_rpt's
+  refusal diagnostics (`Unknown action name`, `Unknown node number`, `is not
+  ready`, usage text) in the AMI response and return HTTP 502 instead of
+  reporting success.
+- `tests/` — first test suite for this repository. 39 tests covering exact
+  app_rpt command strings, the disabled capabilities, audit honesty, and the
+  `/capabilities` contract.
+
+### Changed
+
+- `GET /capabilities` now reports `"dtmf": false` and `"macros": false`, adds an
+  `announcements` list and an `unavailable` map explaining each disabled
+  capability. The `cop_commands: [10, 12, 13, 14]` field is **removed** — it
+  advertised the mis-mapped commands, so clients auto-configuring from it
+  inherited the bug.
+- `ami_client.cop()`, `send_dtmf()` and `execute_macro()` are removed and
+  replaced by behaviour-named methods: `force_id()`, `say_time()`,
+  `say_version()`, `say_status()`.
+
+### Note on versioning
+
+1.4.1 shipped without bumping `app.version`, which still read `1.4.0`. This
+release sets it to `1.4.2`; there is no `1.4.1` entry below.
+
+---
+
 ## [1.4.0] - 2026-05-10
 
 ### Added

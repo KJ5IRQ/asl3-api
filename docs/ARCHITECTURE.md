@@ -95,10 +95,33 @@ All AMI communication. Uses panoramisk for async AMI over TCP.
 | Connect (monitor) | `rpt cmd {node} ilink 2 {remote}` |
 | Disconnect one node | `rpt cmd {node} ilink 1 {remote}` |
 | Disconnect all | `rpt cmd {node} ilink 6` |
-| Send DTMF | `rpt cmd {node} senddigits {sequence}` |
-| Execute macro | `rpt cmd {node} cop 6 {macro_number}` |
-| COP command | `rpt cmd {node} cop {number}` |
+| Force ID | `rpt cmd {node} status 1` |
+| Say time | `rpt cmd {node} status 2` |
+| Say version | `rpt cmd {node} status 3` |
+| Say system status | `rpt cmd {node} ilink 5` |
 | AMI health check | `Ping` action |
+
+No COP command is issued by any endpoint. Through 1.4.1 the four announcement
+endpoints issued COP 10/12/13/14 — verified against `AllStarLink/app_rpt`
+(`apps/app_rpt/rpt_functions.c`, `function_cop`) to be *autopatch disable*,
+*link disable*, *query system control state* and *change system control state*.
+They were corrected in 1.4.2 to the `status` and `ilink` functions above.
+
+### DTMF and macros — deliberately not implemented
+
+| Operation | Broken command (≤1.4.1) | Why it never worked | Working command |
+|-----------|-------------------------|---------------------|-----------------|
+| Send DTMF | `rpt cmd {node} senddigits {seq}` | `senddigits` is absent from app_rpt's `function_table`; `rpt_function_lookup()` fails and app_rpt answers `Unknown action name senddigits.` | `rpt fun {node} {digits}` |
+| Execute macro | `rpt cmd {node} cop 6 {macro}` | COP 6 is *Simulate COR being activated (phone only)* and returns `DC_INDETERMINATE` unless `command_source` is `SOURCE_PHONE`; `rpt cmd` always sets `SOURCE_RPT` | `rpt cmd {node} macro {n} {macro}` |
+
+`ami_client` never inspected the AMI response, so both reported success for
+operations that did not run.
+
+The working commands are **not** wired up. Both inject into the node's own DTMF
+function decoder, so their effect is whatever that node's `rpt.conf`
+`[functions]` / `[macro]` stanzas define — up to and including link control and
+control-operator state changes. They stay unavailable (HTTP 503) until policy
+gating exists.
 
 ### `ami_event_listener.py` — SSE Event Broadcaster
 
@@ -173,12 +196,12 @@ GET /events?api_key=...
 | POST | /connect | Header | Connect to remote node |
 | POST | /disconnect | Header | Disconnect specific node |
 | POST | /disconnect-all | Header | Disconnect all nodes |
-| POST | /dtmf | Header | Send DTMF sequence |
-| POST | /macro | Header | Execute rpt.conf macro |
-| POST | /cop/identify | Header | Play node ID (COP 10) |
-| POST | /cop/time | Header | Say current time (COP 12) |
-| POST | /cop/status | Header | Say system status (COP 13) |
-| POST | /cop/version | Header | Say app_rpt version (COP 14) |
+| POST | /dtmf | Header | Disabled since 1.4.2 — always 503 |
+| POST | /macro | Header | Disabled since 1.4.2 — always 503 |
+| POST | /cop/identify | Header | Force node ID (`status 1`) |
+| POST | /cop/time | Header | Say current time (`status 2`) |
+| POST | /cop/status | Header | Say system status (`ilink 5`) |
+| POST | /cop/version | Header | Say app_rpt version (`status 3`) |
 | GET | /audit | Header | Recent audit log entries (structured) |
 
 ## SSE Event Reference

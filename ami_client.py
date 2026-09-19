@@ -2,13 +2,109 @@
 import asyncio
 import logging
 import re
-from typing import Dict, List, Optional
+from collections.abc import Mapping
+from typing import Any, Dict, List, Optional
 
 from panoramisk import Manager
 
 from config import config
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# AMI response normalization
+#
+# panoramisk's Manager.send_action() resolves to a panoramisk.message.Message,
+# which subclasses panoramisk.utils.CaseInsensitiveDict -> MutableMapping.
+# It is NOT a dict: isinstance(Message(...), dict) is False. Any check that
+# assumes dict silently discards the response body.
+#
+# Asterisk reports Action: Command output in two shapes, and both occur:
+#
+#   Asterisk 13+ (what ASL3 runs)
+#       Response: Success
+#       Output: <line>          <- repeated; panoramisk collapses repeated
+#       Output: <line>             headers into a list under key 'Output'
+#     -> Message['Output'] is a list[str]; Message.content is ''
+#
+#   Legacy
+#       Response: Follows
+#       <body>
+#     -> Message.content holds the body; 'Output' is absent
+#
+# An explicit failure (Response: Error / Failed) carries neither, and is
+# identified by Message.success being False.
+# ---------------------------------------------------------------------------
+
+
+def normalize_ami_output(response: Any) -> List[str]:
+    """
+    Return the output lines of an AMI Command response as a list of strings.
+
+    Accepts a panoramisk Message, any other Mapping, or a plain dict, and
+    covers both the 'Output' header and body-content shapes. Returns an empty
+    list when the response carries no output; callers must not read that as
+    either success or failure on its own.
+    """
+    chunks: List[str] = []
+
+    output = response.get("Output") if isinstance(response, Mapping) else None
+    if output is None:
+        attr = getattr(response, "Output", None)
+        output = attr if isinstance(attr, (str, list, tuple)) else None
+    if isinstance(output, str):
+        chunks.append(output)
+    elif isinstance(output, (list, tuple)):
+        chunks.extend(str(item) for item in output)
+
+    content = response.get("content") if isinstance(response, Mapping) else None
+    if not isinstance(content, str) or not content:
+        attr = getattr(response, "content", None)
+        content = attr if isinstance(attr, str) else None
+    if content:
+        chunks.append(content)
+
+    lines: List[str] = []
+    for chunk in chunks:
+        lines.extend(chunk.split("\n"))
+    return [line.rstrip("\r").strip() for line in lines if line.strip()]
+
+
+def ami_failure_detail(response: Any) -> Optional[str]:
+    """
+    Return failure text when the AMI response is an explicit failure.
+
+    panoramisk exposes Message.success, true for Response: Success / Follows /
+    Goodbye and for events. Only an explicit False counts: a plain dict has no
+    such attribute, and CaseInsensitiveDict.__getattr__ answers '' for unknown
+    attributes, neither of which is False.
+    """
+    if getattr(response, "success", None) is not False:
+        return None
+    message = response.get("Message") if isinstance(response, Mapping) else None
+    if not isinstance(message, str) or not message:
+        message = None
+    lines = normalize_ami_output(response)
+    detail = message or (" ".join(lines) if lines else "")
+    response_code = response.get("Response") if isinstance(response, Mapping) else None
+    prefix = f"AMI responded {response_code}" if response_code else "AMI reported failure"
+    return f"{prefix}: {detail}" if detail else prefix
+
+
+class CommandRejected(Exception):
+    """
+    Raised when app_rpt accepted the AMI connection but refused the command.
+
+    Distinct from a transport failure: the API reached Asterisk, and Asterisk
+    declined to run what it was asked. Callers should surface this as an
+    upstream rejection rather than reporting success.
+    """
+
+    def __init__(self, command: str, reason: str):
+        self.command = command
+        self.reason = reason
+        super().__init__(f"app_rpt refused '{command}': {reason}")
 
 
 class AMIClient:
@@ -184,57 +280,139 @@ class AMIClient:
         return {"success": True, "command": command}
 
     # ------------------------------------------------------------------
-    # DTMF
+    # DTMF and macros
+    #
+    # Intentionally not implemented. The previous implementations issued
+    # 'rpt cmd <node> senddigits <seq>' and 'rpt cmd <node> cop 6 <macro>'.
+    # Neither is a valid way to do what it claimed:
+    #
+    #   senddigits  is not an app_rpt function at all. It does not appear in
+    #               function_table (apps/app_rpt.c), so rpt_function_lookup()
+    #               fails and app_rpt answers "Unknown action name senddigits."
+    #
+    #   cop 6       is "Simulate COR being activated (phone only)" and returns
+    #               DC_INDETERMINATE unless command_source is SOURCE_PHONE.
+    #               'rpt cmd' always sets SOURCE_RPT, so it never ran.
+    #               Macro execution is the separate 'macro' function class.
+    #
+    # Both silently did nothing while the API reported success. The correct
+    # commands ('rpt fun <node> <digits>' and 'rpt cmd <node> macro <n> <m>')
+    # execute arbitrary entries from the node's own rpt.conf, so their blast
+    # radius is configuration-dependent. They are deliberately left unbuilt
+    # until the policy-gating design lands. See docs/ARCHITECTURE.md.
     # ------------------------------------------------------------------
 
-    async def send_dtmf(self, sequence: str) -> Dict:
-        """
-        Send a DTMF sequence to the local node.
-
-        Uses 'rpt cmd <node> senddigits <sequence>'. Valid characters are
-        0-9, *, and #. The sequence is sent as-is; validation is handled
-        by the caller.
-        """
-        command = f"rpt cmd {config.node_number} senddigits {sequence}"
-        await self.send_command(command)
-        return {"success": True, "command": command, "sequence": sequence}
-
     # ------------------------------------------------------------------
-    # Macros
+    # Command acceptance
     # ------------------------------------------------------------------
 
-    async def execute_macro(self, macro_number: str) -> Dict:
-        """
-        Execute a macro defined in rpt.conf.
+    #: Diagnostics app_rpt's rpt_do_cmd() writes when it refuses a command.
+    #: Source: AllStarLink/app_rpt apps/app_rpt/rpt_cli.c
+    #:   "Unknown node number %s."  node not configured on this Asterisk
+    #:   "Node %s is not ready."    node present but not initialised
+    #:   "Unknown action name %s."  no such entry in function_table
+    #:   usage text                 too few arguments for the function
+    REFUSAL_MARKERS = (
+        "Unknown node number",
+        "is not ready",
+        "Unknown action name",
+        "Usage: rpt cmd",
+    )
 
-        Macros are triggered via DTMF using the *D prefix, e.g. *D1 runs
-        macro 1. This method sends the equivalent command directly via AMI
-        without requiring an over-the-air DTMF transmission.
+    @classmethod
+    def _rejection_reason(cls, response: Any) -> Optional[str]:
         """
-        command = f"rpt cmd {config.node_number} cop 6 {macro_number}"
-        await self.send_command(command)
-        return {"success": True, "command": command, "macro_number": macro_number}
+        Return refusal text for an 'rpt cmd' submission, or None if accepted.
+
+        Two distinct kinds of refusal, checked in order:
+
+        1. AMI itself failed the action (Response: Error / Failed). Reported
+           regardless of body content — an explicit failure is never treated
+           as success.
+        2. AMI accepted the action, but app_rpt's CLI handler declined to run
+           the command and wrote a diagnostic. That text arrives in the Command
+           output, so a submitted-but-refused command is detectable without
+           querying node state afterwards.
+
+        Response shape handling lives in normalize_ami_output(), so this works
+        against a real panoramisk Message as well as a plain dict.
+        """
+        failure = ami_failure_detail(response)
+        if failure:
+            return failure
+
+        joined = " ".join(normalize_ami_output(response)).strip()
+        if any(marker in joined for marker in cls.REFUSAL_MARKERS):
+            return joined
+        return None
+
+    async def _send_checked(self, command: str) -> Any:
+        """Send an 'rpt cmd' and raise if AMI or app_rpt refused it."""
+        response = await self.send_command(command)
+        reason = self._rejection_reason(response)
+        if reason:
+            logger.error(f"app_rpt refused [{command}]: {reason}")
+            raise CommandRejected(command, reason)
+        return response
 
     # ------------------------------------------------------------------
-    # COP (Control Operator) commands
+    # Announcements (over-the-air telemetry)
+    #
+    # Command numbers below are verified against AllStarLink/app_rpt,
+    # apps/app_rpt/rpt_functions.c. Do not change them without re-reading
+    # function_status() and function_ilink() — the COP numbers previously
+    # used here were control-operator state changes, not announcements.
     # ------------------------------------------------------------------
 
-    async def cop(self, cop_number: int) -> Dict:
+    async def force_id(self) -> Dict:
         """
-        Execute a COP (Control Operator) command.
+        Force the node to identify over the air.
 
-        COP commands confirmed on ASL3:
-          10 - Play node ID
-          12 - Say current time
-          13 - Say system status
-          14 - Say app_rpt software version
-
-        Note: rpt showvars is not a valid ASL3 command.
-        Use get_node_variables() instead.
+        app_rpt: status 1 — function_status case 1, "System ID".
+        Default DTMF equivalent: *80.
         """
-        command = f"rpt cmd {config.node_number} cop {cop_number}"
-        await self.send_command(command)
-        return {"success": True, "command": command, "cop": cop_number}
+        command = f"rpt cmd {config.node_number} status 1"
+        await self._send_checked(command)
+        return {"success": True, "command": command}
+
+    async def say_time(self) -> Dict:
+        """
+        Announce the current time over the air.
+
+        app_rpt: status 2 — function_status case 2, "System Time".
+        Default DTMF equivalent: *81.
+        """
+        command = f"rpt cmd {config.node_number} status 2"
+        await self._send_checked(command)
+        return {"success": True, "command": command}
+
+    async def say_version(self) -> Dict:
+        """
+        Announce the app_rpt software version over the air.
+
+        app_rpt: status 3 — function_status case 3, "app_rpt.c version".
+        Default DTMF equivalent: *980.
+        """
+        command = f"rpt cmd {config.node_number} status 3"
+        await self._send_checked(command)
+        return {"success": True, "command": command}
+
+    async def say_status(self) -> Dict:
+        """
+        Announce system/connection status over the air.
+
+        app_rpt: ilink 5 — function_ilink case 5, "Status", which emits STATUS
+        telemetry. app_rpt labels its local-only counterpart (status 13) as
+        "Local System status (ILINK, 5)", confirming ilink 5 is the system
+        status announcement.
+
+        ilink 15 ("Full Status", FULLSTATUS) enumerates every connected node
+        and produces a longer transmission. This endpoint's documented contract
+        is "say the system status", so the shorter form is used.
+        """
+        command = f"rpt cmd {config.node_number} ilink 5"
+        await self._send_checked(command)
+        return {"success": True, "command": command}
 
     # ------------------------------------------------------------------
     # Response parsers

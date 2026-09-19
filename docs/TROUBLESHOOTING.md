@@ -198,26 +198,113 @@ This is normal behavior. The 8 seconds is the wait, not a timeout — the API wi
 
 ---
 
-## DTMF Endpoint Returns 400
+## DTMF or Macro Endpoint Returns 503
 
-**Symptom:** POST to `/dtmf` returns HTTP 400.
+**Symptom:** POST to `/dtmf` or `/macro` returns HTTP 503 with
+`{"detail": {"error": "capability_disabled", ...}}`.
 
-**Cause 1:** `confirmed` is not set to `true`:
-```json
-{"sequence": "#", "confirmed": true}
-```
+**This is expected on 1.4.2 and later.** Both capabilities are switched off.
 
-**Cause 2:** The sequence contains invalid characters. Only `0-9`, `*`, and `#` are accepted.
+Neither endpoint ever worked. `/dtmf` issued `rpt cmd <node> senddigits <seq>`,
+and `senddigits` is not an app_rpt function — app_rpt replied `Unknown action
+name senddigits.` `/macro` issued `rpt cmd <node> cop 6 <macro>`, and COP 6 is
+*Simulate COR being activated (phone only)*, which is ignored when the command
+comes from `rpt cmd`. Because the API never checked the AMI response, both
+returned `{"success": true}` and wrote an audit entry claiming execution.
+
+They are disabled rather than repaired because the commands that *do* work
+(`rpt fun` and the `macro` function class) execute arbitrary entries from your
+node's own `rpt.conf`, including link control and control-operator functions.
+Exposing that needs a safety design that does not exist yet.
+
+There is no workaround through this API. Use the Asterisk CLI directly if you
+need DTMF or macro execution in the meantime.
 
 ---
 
-## Macro Endpoint Has No Effect
+## Checking Whether the Pre-1.4.2 COP Bug Altered Your Node
 
-**Symptom:** `/macro` returns `{"success": true}` but nothing happens on the node.
+**Background.** Through 1.4.1, `/cop/identify` issued COP 10 (*autopatch
+disable*) and `/cop/time` issued COP 12 (*link disable*). Both write persistent
+flags into the node's currently selected system state. 1.4.2 issues `status 1`
+and `status 2` instead, so the cause is gone — but a node that was affected
+earlier may still be sitting in the altered state.
 
-Macros must be defined in `/etc/asterisk/rpt.conf` before they can be executed. If macro 1 is not defined, the command fires but Asterisk silently ignores it.
+**This does not mean your node is affected.** Work through the check below
+before changing anything. Do not run recovery commands first: they are
+themselves state-changing, and firing them blind can overwrite a profile you
+configured deliberately and destroy the evidence of what actually happened.
 
-Check your rpt.conf for a `[macro]` section or `macro1=` entries. See the [ASL3 Macros documentation](https://allstarlink.github.io/adv-topics/macros/) for how to define macros.
+### Step 1 — Read the current state (read-only)
+
+Either of these reads the node without modifying it. `rpt stats` makes no
+change to node state and transmits nothing.
+
+```bash
+# On the node
+asterisk -rx "rpt stats YOUR_NODE"
+```
+
+```bash
+# Or through the API, which runs the same command
+curl -s -H "X-API-Key: $API_KEY" "http://your-pi-ip:8073/status?raw=true"
+```
+
+The API path returns the unparsed command output under `raw_output`.
+
+### Step 2 — Find these three lines
+
+```
+Selected system state............................: 0
+Autopatch........................................: ENABLED
+User linking commands............................: ENABLED
+```
+
+Note all three. The first tells you *which* control-state profile is active;
+the other two are the flags COP 10 and COP 12 write.
+
+### Step 3 — Compare against your configured baseline
+
+Open `/etc/asterisk/rpt.conf` and find the `[controlstates]` stanza. Each entry
+defines the intended flags for one system state, using keywords such as
+`rptena`/`rptdis`, `apena`/`apdis`, `lnkena`/`lnkdis`.
+
+Compare the **observed** values from Step 2 against the entry for the **system
+state number** you saw. For example, if `Selected system state` is `0` and your
+`[controlstates]` entry `0` contains `apena` and `lnkena`, then `Autopatch` and
+`User linking commands` should both read `ENABLED`.
+
+- **They match your configuration** — nothing to repair. Stop here.
+- **They diverge** — something changed them at runtime. That may have been this
+  bug, but it can also be the `[scheduler]` stanza switching states on a timer,
+  or someone entering DTMF on the node. Confirm which before acting.
+
+To help attribute it, `GET /audit` timestamps every `cop/identify` and
+`cop/time` call the API made. If one appears *after* the node's last restart
+**and** the flags diverge from your configured baseline, this bug is the likely
+cause.
+
+### Important: a clean reading does not prove the bug never fired
+
+app_rpt reloads `[controlstates]` from `rpt.conf` whenever the configuration is
+loaded, so any Asterisk restart or app_rpt reload resets these flags to your
+configured baseline. If the node has restarted since the affected call, the
+state is already back to normal and no trace remains. A clean reading means the
+node is fine **now** — it is not evidence about the past.
+
+### Step 4 — Recovery, only if Step 3 showed a real divergence
+
+**These are state-changing commands.** Run them only after you have established
+that the current state is wrong and decided it should be changed.
+
+```bash
+asterisk -rx "rpt cmd YOUR_NODE cop 9"    # autopatch enable
+asterisk -rx "rpt cmd YOUR_NODE cop 11"   # link enable
+```
+
+Issue only the one matching the flag you found wrong. This API deliberately
+exposes no endpoint for either — re-enabling is an operator decision, not an
+automated one. Re-run Step 1 afterwards to confirm the result.
 
 ---
 
