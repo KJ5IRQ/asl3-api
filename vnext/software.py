@@ -11,8 +11,9 @@ Asterisk and app_rpt versions are detected with read-only local reads only:
   no request field can influence it.
 
 Neither read targets a node, changes node state, or crosses the operation
-ledger's dispatch boundary. The on-air ``status 3`` announcement is deliberately
-not used: it transmits, and a version is not worth keying a transmitter for.
+ledger's dispatch boundary. app_rpt's on-air ``status 3`` is deliberately not
+used for discovery: it emits link telemetry rather than returning a value to
+the caller, and it is not an announcement this release supports.
 
 Any missing, malformed, repeated, or unavailable value stays explicitly unknown
 (``version: null`` with ``detected: false``). A version is never inferred,

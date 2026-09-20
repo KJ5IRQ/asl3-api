@@ -1,5 +1,26 @@
 # Unreleased — ASL3 Remote Platform vNext
 
+- Supported announcement kinds are exactly `identify` and `status`. `time` and
+  `version` are withdrawn from the public contract, from `/v1/capabilities`,
+  and from the legacy capabilities endpoint. Their mappings (`status 2` /
+  `status 3`) were always correct, but app_rpt converts both into link
+  telemetry text — `T <node> STATS_TIME,<epoch>` and `STATS_VERSION,<version>`
+  — addressed to transceive links, and the *receiving* node's telemetry policy
+  decides whether anything is spoken. This API can neither observe nor control
+  that, so it cannot honestly advertise them as announcements.
+  A withdrawn kind is refused with `422 UNSUPPORTED_ANNOUNCEMENT` before
+  admission: no operation is accepted, no ledger row is written, and no AMI
+  command is dispatched. `POST /cop/time` and `POST /cop/version` are retained
+  and return the same refusal rather than a 404. `identify` (`status 1`) and
+  `status` (`ilink 5`) are unchanged. Note that on app_rpt 3.10+ an ordinary
+  linked STATUS loses the receiver-side telemetry exemption present in
+  3.8.3–3.9.x, so its audible result on a remote node is not guaranteed there.
+- Document `RPT_TXKEYED` accurately as app_rpt's main/local TX **logical**
+  state. It is not proof of RF, of a keyed transmitter, or of audio crossing a
+  native link; on a radioless `Local/pseudo` hub it can be true while nothing
+  reaches the links. The conservative interlock is unchanged: `tx_keyed` true
+  still makes the traffic aggregate `ACTIVE` and refuses announcements and link
+  changes.
 - Add canonical `/v1` state, capabilities, directory, operations, SSE, link and
   announcement resources with named header credentials and problem responses.
 - Replace canonical observation with strict native RptStatus/XStat and ALINKS

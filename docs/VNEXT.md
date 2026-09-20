@@ -18,6 +18,18 @@ state. Disagreement during app_rpt's non-atomic snapshot is unknown. A direct
 link that app_rpt omits from ALINKS (for example local-monitor mode) likewise
 prevents a false absence claim.
 
+`RPT_TXKEYED` is app_rpt's main/local TX **logical** state. It is not proof of
+RF, of a physically keyed transmitter, or of audio crossing a native link.
+app_rpt mixes audio in two places: `RPT_CONF` carries audio on the native
+AllStar links, while `RPT_TXCONF` carries local TX audio, where most ordinary
+telemetry lands. On a radioless hub using `rxchannel = Local/pseudo` there is
+no transmitter at all, so `RPT_TXKEYED=1` can be true while nothing is heard
+on any link. Safety policy does not soften for this: `tx_keyed` true still
+makes the traffic aggregate `ACTIVE`, and announcements and link changes are
+refused. Reading it as "the transmitter is on" is the misinterpretation to
+avoid; reading it as "the node is doing something locally, treat as busy" is
+correct.
+
 `LinkedNodes` is a topology-wide field, never direct adjacency. It is checked
 for malformed/sentinel evidence but does not populate `direct_links`. Complete
 snapshots have actual boolean values and a direct-link list; incomplete
@@ -69,8 +81,30 @@ Announcements therefore finish `ACKNOWLEDGED / UNKNOWN` with
 
 Exact target unlink is `ilink 11`, including permanent links. Unlink-all is a
 single `ilink 6`. Link creation is `ilink 3` or `ilink 2`. Announcement mappings
-are identify=`status 1`, time=`status 2`, version=`status 3`, status=`ilink 5`.
+are identify=`status 1` and status=`ilink 5`.
 No arbitrary command text comes from request fields.
+
+`time` and `version` are withdrawn from the supported announcement set. Their
+mappings (`status 2` / `status 3`) were correct, but app_rpt converts both into
+link telemetry text — `T <node> STATS_TIME,<epoch>` and
+`STATS_VERSION,<version>` — addressed to transceive links, and the *receiving*
+node's telemetry policy decides whether anything is spoken. This API can
+neither observe nor control that, so it cannot honestly advertise them as
+announcements. `identify` queues `ID1` into `RPT_CONF`, which is hub-originated
+audio on the native links; `status` is rendered by app_rpt's own status
+telemetry path.
+
+One version sensitivity applies to `status`: on app_rpt 3.8.3 through 3.9.x an
+ordinary linked STATUS carries a receiver-side telemetry exemption. On app_rpt
+3.10+ that exemption moved to `LOCALSTATUS`, so linked STATUS again becomes
+dependent on receiver telemetry policy. The command is correct on both; the
+audible result on a remote node is not guaranteed.
+
+A withdrawn kind is refused with `422 UNSUPPORTED_ANNOUNCEMENT` before
+admission. The narrowed request schema rejects it at the route boundary,
+`command_for()` refuses it as a last gate on every dispatch path, and the
+legacy `/cop/time` and `/cop/version` aliases raise the same problem code
+directly. No ledger row is created and no AMI command is dispatched.
 
 All admission paths, including legacy aliases, share a local file lock,
 serialization lock, ledger, and dispatch adapter. SQLite uses WAL and
@@ -154,8 +188,10 @@ Detection uses only bounded read-only AMI reads against the local Asterisk:
   request field, node number, or configured node can influence it.
 
 Neither read targets a node, changes node state, or crosses the ledger's
-dispatch boundary; a capabilities request cannot dispatch control. The on-air
-`status 3` announcement is deliberately not used for discovery: it transmits.
+dispatch boundary; a capabilities request cannot dispatch control. app_rpt's
+on-air `status 3` is deliberately not used for discovery: it emits link
+telemetry rather than returning a value to the caller. It is also not an
+announcement this release supports.
 
 Failures are explicit and per-component. If the probe cannot complete, if AMI
 refuses it, or if a response is missing, repeated, or shaped differently than

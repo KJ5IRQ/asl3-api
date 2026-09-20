@@ -15,6 +15,6 @@ pytest==9.1.1
 # Not a runtime dependency — the service itself never imports httpx.
 httpx==0.28.1
 
-# Linter. CI runs `ruff check tests/` only; the application modules carry
-# pre-existing style debt that is out of scope for the safety hotfix.
+# Linter. CI runs `ruff check vnext/ tests/`; the pre-vNext legacy modules
+# carry style debt that predates this work and is deliberately not gated.
 ruff==0.16.8

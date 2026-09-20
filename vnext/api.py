@@ -14,6 +14,8 @@ from fastapi.security import APIKeyHeader
 from starlette.exceptions import HTTPException
 
 from .models import (
+    SUPPORTED_ANNOUNCEMENTS,
+    WITHDRAWN_ANNOUNCEMENTS,
     AnnouncementRequest,
     LinkRequest,
     Node,
@@ -21,10 +23,31 @@ from .models import (
     Operation,
     Problem,
     ProblemError,
+    unsupported_announcement_detail,
 )
 
 api_key = APIKeyHeader(name="X-API-Key", auto_error=False)
 RESULT_CONTRACT_VERSION = "1.0"
+
+
+def withdrawn_announcement(exc) -> str | None:
+    """Return the withdrawn announcement kind a validation error names, if any.
+
+    The route schema rejects these before the handler runs, so the refusal
+    arrives as a RequestValidationError. Without this, a client asking for a
+    withdrawn announcement would get the generic INVALID_REQUEST and no way to
+    tell "you sent nonsense" apart from "that capability was removed".
+    """
+    reader = getattr(exc, "errors", None)
+    if not callable(reader):  # pragma: no cover - defensive
+        return None
+    for error in reader():
+        location = error.get("loc") or ()
+        if location and location[-1] == "kind":
+            value = error.get("input")
+            if isinstance(value, str) and value in WITHDRAWN_ANNOUNCEMENTS:
+                return value
+    return None
 
 
 def credentials(config):
@@ -105,6 +128,16 @@ def install_api(
         exc,
     ):
         if request.url.path.startswith("/v1/"):
+            kind = withdrawn_announcement(exc)
+            if kind is not None:
+                return problem_response(
+                    request,
+                    422,
+                    "UNSUPPORTED_ANNOUNCEMENT",
+                    unsupported_announcement_detail(
+                        kind
+                    ),
+                )
             return problem_response(
                 request,
                 422,
@@ -325,12 +358,9 @@ def install_api(
                 "sse_snapshots": config.events_enabled,
                 "control_enabled": control_enabled,
                 "supported_operations": operations,
-                "announcements": [
-                    "identify",
-                    "time",
-                    "status",
-                    "version",
-                ],
+                "announcements": list(
+                    SUPPORTED_ANNOUNCEMENTS
+                ),
                 "dtmf": False,
                 "macros": False,
                 "idempotency": True,

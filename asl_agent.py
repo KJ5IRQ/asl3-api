@@ -21,7 +21,11 @@ from config import config
 from event_handler import EventHandler
 from node_cache import node_cache
 from vnext.api import authenticate, install_api, problem_response
-from vnext.models import ProblemError
+from vnext.models import (
+    SUPPORTED_ANNOUNCEMENTS,
+    ProblemError,
+    unsupported_announcement_detail,
+)
 from vnext.service import Platform
 
 # ---------------------------------------------------------------------------
@@ -372,7 +376,7 @@ async def get_capabilities():
             "node_enrichment": True,
             "dtmf": False,
             "macros": False,
-            "announcements": ["identify", "time", "status", "version"],
+            "announcements": list(SUPPORTED_ANNOUNCEMENTS),
         },
         "unavailable": {
             "dtmf": (
@@ -609,8 +613,17 @@ async def cop_identify(request: Request):
 @app.post("/cop/time", dependencies=[Depends(verify_api_key)], tags=["Control"])
 @limiter.limit(lambda: f"{config.rate_limit}/minute")
 async def cop_time(request: Request):
-    """Legacy alias: returns an asynchronous v1 operation and Location."""
-    return legacy_operation(request, "announce", {"kind": "time"})
+    """Withdrawn. Refuses with UNSUPPORTED_ANNOUNCEMENT; admits no operation.
+
+    The route is kept so existing callers get an explicit, stable refusal
+    rather than a 404. It never reaches the control boundary: no operation is
+    admitted, no ledger row is written, and no AMI command is dispatched.
+    """
+    raise ProblemError(
+        422,
+        "UNSUPPORTED_ANNOUNCEMENT",
+        unsupported_announcement_detail("time"),
+    )
 
 
 @app.post("/cop/status", dependencies=[Depends(verify_api_key)], tags=["Control"])
@@ -623,8 +636,17 @@ async def cop_status(request: Request):
 @app.post("/cop/version", dependencies=[Depends(verify_api_key)], tags=["Control"])
 @limiter.limit(lambda: f"{config.rate_limit}/minute")
 async def cop_version(request: Request):
-    """Legacy alias: returns an asynchronous v1 operation and Location."""
-    return legacy_operation(request, "announce", {"kind": "version"})
+    """Withdrawn. Refuses with UNSUPPORTED_ANNOUNCEMENT; admits no operation.
+
+    The route is kept so existing callers get an explicit, stable refusal
+    rather than a 404. It never reaches the control boundary: no operation is
+    admitted, no ledger row is written, and no AMI command is dispatched.
+    """
+    raise ProblemError(
+        422,
+        "UNSUPPORTED_ANNOUNCEMENT",
+        unsupported_announcement_detail("version"),
+    )
 
 
 # ---------------------------------------------------------------------------

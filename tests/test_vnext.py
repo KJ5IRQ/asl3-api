@@ -326,7 +326,7 @@ def test_restart_recovery_never_redispatches_idempotent_operation(tmp_path):
     ledger = Ledger(tmp_path / "ops.db", TEST_NODE)
     operation, created = ledger.admit(
         "announce",
-        {"kind": "time"},
+        {"kind": "identify"},
         "operator",
         "same",
     )
@@ -342,7 +342,7 @@ def test_restart_recovery_never_redispatches_idempotent_operation(tmp_path):
     assert result.terminal
     same = recovered.find_idempotent(
         "announce",
-        {"kind": "time"},
+        {"kind": "identify"},
         "operator",
         "same",
     )
@@ -350,7 +350,7 @@ def test_restart_recovery_never_redispatches_idempotent_operation(tmp_path):
     with pytest.raises(ProblemError) as exc:
         recovered.find_idempotent(
             "announce",
-            {"kind": "version"},
+            {"kind": "status"},
             "operator",
             "same",
         )
@@ -396,7 +396,7 @@ def test_active_policy_denies_link_and_announcement_without_dispatch(tmp_path):
 
             second = platform.admit(
                 "announce",
-                {"kind": "time"},
+                {"kind": "identify"},
                 "operator",
             )
             await settle(platform)
@@ -479,7 +479,7 @@ def test_failure_before_dispatch_barrier_is_known_not_dispatched(tmp_path):
         try:
             operation = platform.admit(
                 "announce",
-                {"kind": "time"},
+                {"kind": "identify"},
                 "operator",
             )
             await settle(platform)
@@ -501,7 +501,7 @@ def test_lost_response_after_dispatch_is_outcome_unknown_and_never_replayed(tmp_
         try:
             operation = platform.admit(
                 "announce",
-                {"kind": "time"},
+                {"kind": "identify"},
                 "operator",
                 "one-shot",
             )
@@ -510,17 +510,17 @@ def test_lost_response_after_dispatch_is_outcome_unknown_and_never_replayed(tmp_
             assert result.dispatch_status == "OUTCOME_UNKNOWN"
             assert result.effect_status == "UNKNOWN"
             assert result.terminal
-            assert transport.commands == [f"rpt cmd {TEST_NODE} status 2"]
+            assert transport.commands == [f"rpt cmd {TEST_NODE} status 1"]
 
             retry = platform.admit(
                 "announce",
-                {"kind": "time"},
+                {"kind": "identify"},
                 "operator",
                 "one-shot",
             )
             assert retry.id == operation.id
             await settle(platform)
-            assert transport.commands == [f"rpt cmd {TEST_NODE} status 2"]
+            assert transport.commands == [f"rpt cmd {TEST_NODE} status 1"]
         finally:
             await platform.close()
 
@@ -538,7 +538,7 @@ def test_dispatch_barrier_persistence_failure_prevents_control_write(tmp_path, m
         try:
             operation = platform.admit(
                 "announce",
-                {"kind": "time"},
+                {"kind": "identify"},
                 "operator",
             )
             await settle(platform)
@@ -569,12 +569,12 @@ def test_post_dispatch_persistence_failure_fail_closes_until_restart(tmp_path, m
         try:
             platform.admit(
                 "announce",
-                {"kind": "time"},
+                {"kind": "identify"},
                 "operator",
                 "persist-fail",
             )
             await settle(platform)
-            assert transport.commands == [f"rpt cmd {TEST_NODE} status 2"]
+            assert transport.commands == [f"rpt cmd {TEST_NODE} status 1"]
             assert platform.healthy is False
 
             with pytest.raises(ProblemError) as exc:
@@ -584,7 +584,7 @@ def test_post_dispatch_persistence_failure_fail_closes_until_restart(tmp_path, m
             with pytest.raises(ProblemError) as exc:
                 platform.admit(
                     "announce",
-                    {"kind": "time"},
+                    {"kind": "identify"},
                     "operator",
                     "persist-fail",
                 )

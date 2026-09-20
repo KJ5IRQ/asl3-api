@@ -122,7 +122,7 @@ def test_control_returns_202_operation_and_location():
             "X-API-Key": TEST_API_KEY,
             "Idempotency-Key": "logical-operation-1",
         },
-        json={"kind": "time"},
+        json={"kind": "identify"},
     )
     assert response.status_code == 202
     body = response.json()
@@ -132,7 +132,7 @@ def test_control_returns_202_operation_and_location():
     assert runtime.admissions == [
         (
             "announce",
-            {"kind": "time"},
+            {"kind": "identify"},
             "legacy",
             "logical-operation-1",
         )
@@ -155,7 +155,7 @@ def test_observe_only_credential_cannot_control():
     denied = client.post(
         "/v1/announcements",
         headers={"X-API-Key": "read-key"},
-        json={"kind": "time"},
+        json={"kind": "identify"},
     )
     assert denied.status_code == 403
     assert denied.json()["code"] == "AUTHORITY_DENIED"
@@ -179,7 +179,7 @@ def test_operation_lookup_uses_same_durable_resource():
     created = client.post(
         "/v1/announcements",
         headers={"X-API-Key": TEST_API_KEY},
-        json={"kind": "version"},
+        json={"kind": "status"},
     )
     operation_id = created.json()["id"]
     fetched = client.get(

@@ -8,6 +8,32 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 NODE_PATTERN = r"^[1-9][0-9]{0,5}$"
 Node = Annotated[str, StringConstraints(strict=True, pattern=NODE_PATTERN)]
 
+# The only announcement kinds this release supports. Both produce audio the hub
+# itself originates onto its native links: identify queues ID1 into RPT_CONF,
+# and status is rendered by app_rpt's own status telemetry path.
+SUPPORTED_ANNOUNCEMENTS: tuple[str, ...] = ("identify", "status")
+
+# Withdrawn in this release. app_rpt converts time and version into link
+# telemetry text ("T <node> STATS_TIME,<epoch>" / "STATS_VERSION,<version>")
+# addressed to transceive links. Whether anything is spoken is decided by the
+# receiving node's telemetry policy, which this API can neither observe nor
+# control, so it cannot honestly advertise them as announcements. The mappings
+# were never wrong; the product promise was.
+WITHDRAWN_ANNOUNCEMENTS: tuple[str, ...] = ("time", "version")
+
+
+def unsupported_announcement_detail(kind: str) -> str:
+    """One wording for every path that refuses a withdrawn announcement."""
+    supported = ", ".join(SUPPORTED_ANNOUNCEMENTS)
+    if kind in WITHDRAWN_ANNOUNCEMENTS:
+        return (
+            f"Announcement kind {kind!r} is withdrawn. app_rpt delivers it as "
+            "link telemetry text, and whether it is spoken depends on the "
+            "receiving node's telemetry policy, which this API cannot observe "
+            f"or control. Supported kinds: {supported}."
+        )
+    return f"Announcement kind {kind!r} is not supported. Supported kinds: {supported}."
+
 
 def validate_node(value: str) -> str:
     if not isinstance(value, str) or re.fullmatch(NODE_PATTERN, value, flags=re.ASCII) is None:
@@ -27,7 +53,7 @@ class LinkRequest(BaseModel):
 
 class AnnouncementRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    kind: Literal["identify", "time", "status", "version"]
+    kind: Literal["identify", "status"]
 
 
 class DirectLink(BaseModel):
@@ -52,8 +78,23 @@ class NodeState(BaseModel):
     state_status: Literal["COMPLETE", "STATE_UNKNOWN"]
     traffic_state: Literal["ACTIVE", "CLEAR", "UNKNOWN"]
     complete: bool
-    rx_keyed: bool | None = None
-    tx_keyed: bool | None = None
+    rx_keyed: bool | None = Field(
+        default=None,
+        description=(
+            "app_rpt RPT_RXKEYED: receiver logical state. null when unknown."
+        ),
+    )
+    tx_keyed: bool | None = Field(
+        default=None,
+        description=(
+            "app_rpt RPT_TXKEYED: main/local TX logical state. It is not proof "
+            "of RF, of a physically keyed transmitter, or of audio crossing a "
+            "native link. On a radioless Local/pseudo hub it can be true while "
+            "nothing reaches the links, because most telemetry is mixed into "
+            "RPT_TXCONF while native link audio lives in RPT_CONF. Safety "
+            "policy still treats true as ACTIVE traffic. null when unknown."
+        ),
+    )
     direct_links: list[DirectLink] | None = None
     reasons: list[str] = Field(default_factory=list)
     source: str = "app_rpt/RptStatus/XStat+SawStat"
@@ -116,12 +157,21 @@ def command_for(node: str, kind: str, request: dict) -> str:
     elif kind == "unlink_all" and not request:
         command = "ilink 6"
     elif kind == "announce":
+        # Defence in depth. The route schema already rejects withdrawn kinds
+        # before admission, but command_for() is the last gate every dispatch
+        # path crosses, and a bare pydantic ValidationError here would escape
+        # as a 500 rather than a stable problem code.
+        requested = request.get("kind") if isinstance(request, dict) else None
+        if isinstance(requested, str) and requested not in SUPPORTED_ANNOUNCEMENTS:
+            raise ProblemError(
+                422,
+                "UNSUPPORTED_ANNOUNCEMENT",
+                unsupported_announcement_detail(requested),
+            )
         body = AnnouncementRequest(**request)
         command = {
             "identify": "status 1",
-            "time": "status 2",
             "status": "ilink 5",
-            "version": "status 3",
         }[body.kind]
     else:
         raise ValueError("Unsupported operation")

@@ -23,7 +23,7 @@ reverse proxy. AMI remains private. See [security](docs/SECURITY.md).
 | POST | `/v1/links` | control | `{"node":"123","mode":"transceive"}` or `"monitor"` |
 | DELETE | `/v1/links/{node}` | control | Exact direct unlink, including permanent links |
 | DELETE | `/v1/links` | control | All links off, including permanent links |
-| POST | `/v1/announcements` | control | `{"kind":"identify"}`; also `time`, `status`, `version` |
+| POST | `/v1/announcements` | control | `{"kind":"identify"}` or `{"kind":"status"}` |
 
 Targets must match ASCII `^[1-9][0-9]{0,5}$`. No directory lookup is required
 for control admission. Private/static nodes are valid targets. Permanent-link
@@ -86,9 +86,11 @@ needed to run the offline tests.
 Legacy observation endpoints remain. `/variables`, `/nodes`, and event
 snapshots now derive from native XStat; unavailable legacy variable fields are
 null. CLI statistics remain a legacy-only interface. Legacy active control
-paths (`/connect`, `/disconnect`, `/disconnect-all`, `/cop/identify`, `/cop/time`,
-`/cop/status`, `/cop/version`) now return asynchronous **202 v1 operations**.
+paths (`/connect`, `/disconnect`, `/disconnect-all`, `/cop/identify`,
+`/cop/status`) now return asynchronous **202 v1 operations**.
 This intentional response change prevents a second, unsafe dispatch path.
+`/cop/time` and `/cop/version` are retained but refuse with `422
+UNSUPPORTED_ANNOUNCEMENT`; they admit no operation and dispatch nothing.
 `/dtmf` and `/macro` still refuse with 503 and send nothing.
 
 Legacy `/events` accepts header authentication by default. The optional
