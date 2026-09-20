@@ -226,9 +226,11 @@ need DTMF or macro execution in the meantime.
 
 **Background.** Through 1.4.1, `/cop/identify` issued COP 10 (*autopatch
 disable*) and `/cop/time` issued COP 12 (*link disable*). Both write persistent
-flags into the node's currently selected system state. 1.4.2 issues `status 1`
-and `status 2` instead, so the cause is gone — but a node that was affected
-earlier may still be sitting in the altered state.
+flags into the node's currently selected system state. 1.4.2 replaced those
+mappings, so the cause is gone — but a node that was affected earlier may still
+be sitting in the altered state. (`/cop/time` has since been withdrawn
+entirely and now refuses with `UNSUPPORTED_ANNOUNCEMENT`; `/cop/identify`
+issues `status 1`.)
 
 **This does not mean your node is affected.** Work through the check below
 before changing anything. Do not run recovery commands first: they are

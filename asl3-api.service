@@ -16,7 +16,7 @@ User=INSTALL_USER
 Group=INSTALL_USER
 
 WorkingDirectory=/opt/asl3-api
-ExecStart=/opt/asl3-api/venv/bin/uvicorn asl_agent:app --host 0.0.0.0 --port 8073
+ExecStart=/opt/asl3-api/venv/bin/python /opt/asl3-api/asl_agent.py
 Restart=always
 RestartSec=10
 StandardOutput=journal

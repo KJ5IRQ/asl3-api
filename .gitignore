@@ -28,3 +28,9 @@ audit.log
 # OS
 .DS_Store
 Thumbs.db
+
+# Local durable operation state
+state/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal

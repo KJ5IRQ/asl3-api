@@ -187,7 +187,7 @@ else
 fi
 
 # Source file check
-REQUIRED_FILES=("asl_agent.py" "ami_client.py" "config.py" "event_handler.py" "node_cache.py"
+REQUIRED_FILES=("vnext/api.py" "vnext/service.py" "ami_event_listener.py" "asl_agent.py" "ami_client.py" "config.py" "event_handler.py" "node_cache.py"
                 "config.yaml.example" "requirements.txt" "asl3-api.service")
 for f in "${REQUIRED_FILES[@]}"; do
     if [ ! -f "$SCRIPT_DIR/$f" ]; then
@@ -221,6 +221,8 @@ if confirm "Create $INSTALL_DIR and install files?" "y"; then
     sudo cp "$SCRIPT_DIR/event_handler.py"   "$INSTALL_DIR/"
     sudo cp "$SCRIPT_DIR/node_cache.py"      "$INSTALL_DIR/"
     sudo cp "$SCRIPT_DIR/requirements.txt"   "$INSTALL_DIR/"
+    sudo cp "$SCRIPT_DIR/ami_event_listener.py" "$INSTALL_DIR/"
+    sudo cp -R "$SCRIPT_DIR/vnext" "$INSTALL_DIR/"
 
     # Copy example config only if config.yaml doesn't already exist
     if [ ! -f "$INSTALL_DIR/config.yaml" ]; then
@@ -319,7 +321,7 @@ node:
   callsign: "$NODE_CALLSIGN"
 
 api:
-  host: "0.0.0.0"
+  host: "127.0.0.1"
   port: 8073
   api_key: "$API_KEY"
 

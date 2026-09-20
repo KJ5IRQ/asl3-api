@@ -36,5 +36,5 @@ jobs:
       - name: Test
         run: pytest tests/ -q
 
-      - name: Lint tests
-        run: ruff check tests/
+      - name: Lint vNext and tests
+        run: ruff check vnext/ tests/

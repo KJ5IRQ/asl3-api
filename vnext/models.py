@@ -1,0 +1,179 @@
+"""Public v1 types. Unknown evidence is never represented as false."""
+import re
+from datetime import datetime, timezone
+from typing import Annotated, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+
+NODE_PATTERN = r"^[1-9][0-9]{0,5}$"
+Node = Annotated[str, StringConstraints(strict=True, pattern=NODE_PATTERN)]
+
+# The only announcement kinds this release supports. identify queues ID1 into
+# RPT_CONF as hub-originated link audio. status is different: app_rpt sends
+# STATUS telemetry text across the link, and the receiving node renders it
+# according to its own app_rpt version and telemetry policy.
+SUPPORTED_ANNOUNCEMENTS: tuple[str, ...] = ("identify", "status")
+
+# Withdrawn in this release. app_rpt converts time and version into link
+# telemetry text ("T <node> STATS_TIME,<epoch>" / "STATS_VERSION,<version>")
+# addressed to transceive links. Whether anything is spoken is decided by the
+# receiving node's telemetry policy, which this API can neither observe nor
+# control, so it cannot honestly advertise them as announcements. The mappings
+# were never wrong; the product promise was.
+WITHDRAWN_ANNOUNCEMENTS: tuple[str, ...] = ("time", "version")
+
+
+def unsupported_announcement_detail(kind: str) -> str:
+    """One wording for every path that refuses a withdrawn announcement."""
+    supported = ", ".join(SUPPORTED_ANNOUNCEMENTS)
+    if kind in WITHDRAWN_ANNOUNCEMENTS:
+        return (
+            f"Announcement kind {kind!r} is withdrawn. app_rpt delivers it as "
+            "link telemetry text, and whether it is spoken depends on the "
+            "receiving node's telemetry policy, which this API cannot observe "
+            f"or control. Supported kinds: {supported}."
+        )
+    return f"Announcement kind {kind!r} is not supported. Supported kinds: {supported}."
+
+
+def validate_node(value: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(NODE_PATTERN, value, flags=re.ASCII) is None:
+        raise ValueError("Node must be 1-6 ASCII digits with no leading zero")
+    return value
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+class LinkRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    node: Node
+    mode: Literal["transceive", "monitor"] = "transceive"
+
+
+class AnnouncementRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["identify", "status"]
+
+
+class DirectLink(BaseModel):
+    """One real adjacent app_rpt connection.
+
+    `allstar_node` is populated only when the identifier is a canonical v1
+    AllStar target. Foreign/direct-client links remain observable but cannot be
+    smuggled into the v1 control target namespace.
+    """
+
+    node: str = Field(min_length=1, max_length=64)
+    allstar_node: Node | None = None
+    mode: Literal["T", "R", "L", "C", "UNKNOWN"]
+    keyed: bool
+    connection_status: Literal["ESTABLISHED", "CONNECTING"]
+
+
+class NodeState(BaseModel):
+    node: Node
+    observed_at: str
+    connection_epoch: str | None = None
+    state_status: Literal["COMPLETE", "STATE_UNKNOWN"]
+    traffic_state: Literal["ACTIVE", "CLEAR", "UNKNOWN"]
+    complete: bool
+    rx_keyed: bool | None = Field(
+        default=None,
+        description=(
+            "app_rpt RPT_RXKEYED: receiver logical state. null when unknown."
+        ),
+    )
+    tx_keyed: bool | None = Field(
+        default=None,
+        description=(
+            "app_rpt RPT_TXKEYED: main/local TX logical state. It is not proof "
+            "of RF, of a physically keyed transmitter, or of audio crossing a "
+            "native link. On a radioless Local/pseudo hub it can be true while "
+            "nothing reaches the links, because most telemetry is mixed into "
+            "RPT_TXCONF while native link audio lives in RPT_CONF. Safety "
+            "policy still treats true as ACTIVE traffic. null when unknown."
+        ),
+    )
+    direct_links: list[DirectLink] | None = None
+    reasons: list[str] = Field(default_factory=list)
+    source: str = "app_rpt/RptStatus/XStat+SawStat"
+
+
+class Operation(BaseModel):
+    id: str
+    node: Node
+    kind: Literal["link_node", "unlink_node", "unlink_all", "announce"]
+    request: dict
+    credential: str
+    created_at: str
+    updated_at: str
+    dispatch_status: Literal[
+        "QUEUED",
+        "DISPATCH_STARTED",
+        "ACKNOWLEDGED",
+        "REJECTED",
+        "NOT_DISPATCHED",
+        "OUTCOME_UNKNOWN",
+    ]
+    effect_status: Literal[
+        "PENDING",
+        "NOT_ATTEMPTED",
+        "OBSERVED_SATISFIED",
+        "OBSERVED_PARTIAL",
+        "OBSERVED_UNSATISFIED",
+        "NOT_APPLICABLE",
+        "UNKNOWN",
+    ]
+    terminal: bool
+    semantic_error: str | None = None
+    evidence: NodeState | None = None
+
+
+class Problem(BaseModel):
+    type: str
+    title: str
+    status: int
+    detail: str
+    code: str
+    instance: str
+
+
+class ProblemError(Exception):
+    def __init__(self, status: int, code: str, detail: str):
+        self.status, self.code, self.detail = status, code, detail
+        super().__init__(detail)
+
+
+def command_for(node: str, kind: str, request: dict) -> str:
+    """Map the small semantic v1 surface to verified app_rpt commands."""
+    validate_node(node)
+    if kind == "link_node":
+        body = LinkRequest(**request)
+        command = f"ilink {2 if body.mode == 'monitor' else 3} {body.node}"
+    elif kind == "unlink_node":
+        # ilink 11 removes the exact target even when it is a permanent link.
+        command = f"ilink 11 {validate_node(request['node'])}"
+    elif kind == "unlink_all" and not request:
+        command = "ilink 6"
+    elif kind == "announce":
+        # Defence in depth. The route schema already rejects withdrawn kinds
+        # before admission, but command_for() is the last gate every dispatch
+        # path crosses, and a bare pydantic ValidationError here would escape
+        # as a 500 rather than a stable problem code.
+        requested = request.get("kind") if isinstance(request, dict) else None
+        if isinstance(requested, str) and requested not in SUPPORTED_ANNOUNCEMENTS:
+            raise ProblemError(
+                422,
+                "UNSUPPORTED_ANNOUNCEMENT",
+                unsupported_announcement_detail(requested),
+            )
+        body = AnnouncementRequest(**request)
+        command = {
+            "identify": "status 1",
+            "status": "ilink 5",
+        }[body.kind]
+    else:
+        raise ValueError("Unsupported operation")
+    return f"rpt cmd {node} {command}"

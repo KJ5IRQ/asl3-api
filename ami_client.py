@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Optional
 from panoramisk import Manager
 
 from config import config
+from vnext.observation import Observer
+from vnext.transport import AMITransport
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +115,7 @@ class AMIClient:
     def __init__(self):
         self.manager: Optional[Manager] = None
         self.connected = False
+        self.observer = Observer(config.node_number, AMITransport(config))
 
     # ------------------------------------------------------------------
     # Connection management
@@ -172,6 +175,10 @@ class AMIClient:
 
     async def send_command(self, command: str) -> Dict:
         """Send an Asterisk CLI command via AMI and return the raw response."""
+        # Panoramisk is observation-only. Legacy control helpers are retained
+        # for command-mapping compatibility, but cannot dispatch in production.
+        if not command.startswith(("rpt show variables ", "rpt stats ", "rpt nodes ", "rpt lstats ")):
+            raise RuntimeError("Control requires the durable v1 operation service")
         if not self.connected or not self.manager:
             raise RuntimeError("AMI is not connected")
         try:
@@ -191,7 +198,8 @@ class AMIClient:
         """
         Get app_rpt variables for the configured node.
 
-        Uses 'rpt show variables {node}' which returns:
+        Compatibility view of the canonical native XStat snapshot.
+        Unsupported legacy fields remain null. Native variables include:
           RPT_RXKEYED     - 1 if signal present on input (node is being keyed)
           RPT_TXKEYED     - 1 if transmitter is active
           RPT_ETXKEYED    - 1 if external TX is keyed
@@ -201,10 +209,18 @@ class AMIClient:
           RPT_ALINKS      - active link list
           RPT_AUTOPATCHUP - 1 if autopatch is active
         """
-        response = await self.send_command(
-            f"rpt show variables {config.node_number}"
-        )
-        return self._parse_variables_response(response)
+        state = await self.observer.snapshot()
+        links = state.direct_links
+        return {
+            "rxkeyed": state.rx_keyed, "txkeyed": state.tx_keyed,
+            "ext_txkeyed": None, "autopatch_up": None,
+            "num_links": len(links) if links is not None else None,
+            "links": ",".join(link.node for link in links) if links is not None else None,
+            "num_active_links": len(links) if links is not None else None,
+            "active_links": ",".join(f"{link.node}{link.mode}{'K' if link.keyed else 'U'}" for link in links)
+            if links is not None else None,
+            "complete": state.complete, "state_status": state.state_status,
+        }
 
     async def get_node_stats(self, include_raw: bool = False) -> Dict:
         """Return parsed statistics for the configured node."""
@@ -216,8 +232,10 @@ class AMIClient:
 
     async def get_connected_nodes(self) -> List[Dict]:
         """Return a list of nodes currently connected to this node."""
-        response = await self.send_command(f"rpt nodes {config.node_number}")
-        return self._parse_nodes_response(response)
+        state = await self.observer.snapshot()
+        if not state.complete:
+            raise RuntimeError("STATE_UNKNOWN: direct adjacency evidence is incomplete")
+        return [link.model_dump() for link in state.direct_links]
 
     # ------------------------------------------------------------------
     # Link control
@@ -257,7 +275,7 @@ class AMIClient:
 
         Polls for confirmation every second up to max_wait seconds.
         """
-        command = f"rpt cmd {config.node_number} ilink 1 {node_number}"
+        command = f"rpt cmd {config.node_number} ilink 11 {node_number}"
         await self.send_command(command)
 
         max_wait = config.disconnect_timeout

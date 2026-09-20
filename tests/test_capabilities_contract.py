@@ -40,13 +40,15 @@ def test_stale_cop_command_list_is_gone(client, auth_headers):
 
 
 def test_announcements_are_advertised(client, auth_headers):
+    """Legacy capabilities must advertise the same supported set as /v1."""
     features = caps(client, auth_headers)["features"]
-    assert set(features["announcements"]) == {
-        "identify",
-        "time",
-        "status",
-        "version",
-    }
+    assert set(features["announcements"]) == {"identify", "status"}
+
+
+def test_withdrawn_announcements_are_not_advertised(client, auth_headers):
+    features = caps(client, auth_headers)["features"]
+    assert "time" not in features["announcements"]
+    assert "version" not in features["announcements"]
 
 
 def test_version_reports_hotfix(client, auth_headers):

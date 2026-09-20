@@ -1,7 +1,9 @@
 """Configuration loader for ASL3-API."""
-import yaml
+import re
 from pathlib import Path
 from typing import Any, Dict
+
+import yaml
 
 
 class Config:
@@ -62,7 +64,7 @@ class Config:
     # --- API ---
     @property
     def api_host(self) -> str:
-        return self.get("api.host", "0.0.0.0")
+        return self.get("api.host", "127.0.0.1")
 
     @property
     def api_port(self) -> int:
@@ -123,14 +125,59 @@ class Config:
         """Validate required fields are present and non-empty. Raise on failure."""
         errors = []
 
-        if not self.node_number:
-            errors.append("node.number is required but not set")
+        if not re.fullmatch(r"[1-9][0-9]{0,5}", self.node_number, flags=re.ASCII):
+            errors.append("node.number must be 1-6 ASCII digits with no leading zero")
+        if self.ami_host not in {"127.0.0.1", "::1", "localhost"}:
+            errors.append("ami.host must remain localhost")
         if not self.node_callsign:
             errors.append("node.callsign is required but not set")
         if not self.ami_password:
             errors.append("ami.password is required but not set")
-        if not self.api_key:
+        if not self.api_key and not self.get("api.credentials", []):
             errors.append("api.api_key is required but not set")
+
+        entries = self.get("api.credentials", [])
+        names, keys = set(), set()
+        if not isinstance(entries, list):
+            errors.append("api.credentials must be a list")
+            entries = []
+        for entry in entries:
+            if (not isinstance(entry, dict) or not isinstance(entry.get("name"), str)
+                    or not entry.get("name") or not isinstance(entry.get("key"), str)
+                    or not entry.get("key") or not isinstance(entry.get("authority"), list)
+                    or not entry["authority"]
+                    or any(scope not in ("observe", "control") for scope in entry["authority"])):
+                errors.append("Each credential needs name, key, and observe/control authority")
+                continue
+            if entry["name"] in names or entry["key"] in keys:
+                errors.append("Credential names and keys must be unique")
+            names.add(entry["name"])
+            keys.add(entry["key"])
+        for value in (self.ami_username, self.ami_password):
+            if "\r" in value or "\n" in value:
+                errors.append("AMI credentials must not contain newlines")
+        for setting in (
+            "timeouts.ami_seconds",
+            "timeouts.observation_seconds",
+            "operations.dispatch_timeout",
+            "operations.effect_timeout",
+        ):
+            value = self.get(setting, 5)
+            if not isinstance(value, (int, float)) or not 0 < value <= 120:
+                errors.append(f"{setting} must be between 0 and 120 seconds")
+
+        for operation, defaults in {
+            "link_node": ("deny", "deny"),
+            "announce": ("deny", "deny"),
+            "unlink_node": ("allow", "allow"),
+            "unlink_all": ("allow", "allow"),
+        }.items():
+            for state, default in zip(("active", "unknown"), defaults):
+                value = self.get(f"policy.traffic.{operation}.{state}", default)
+                if value not in {"allow", "deny"}:
+                    errors.append(
+                        f"policy.traffic.{operation}.{state} must be allow or deny"
+                    )
 
         if errors:
             raise ValueError(
