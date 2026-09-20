@@ -30,8 +30,10 @@ changes. `observed_at` is the API's observation time, not a hardware timestamp.
 
 ## Operations
 
-The result-contract version is `1.0`. The backend adapter version is also
-`1.0`; it is not a claim about the installed app_rpt software version.
+The result-contract version is `1.0`. The backend contract version is the
+adapter's AMI contract identifier, `app_rpt-rptstatus/1`. Neither is a claim
+about installed software: the Asterisk and app_rpt versions a node actually
+runs are reported separately in `backend_software` (see Capabilities).
 
 | dispatch_status | Meaning |
 |---|---|
@@ -122,6 +124,47 @@ with an ASL `code`: `AUTHENTICATION_REQUIRED`, `AUTHORITY_DENIED`,
 `NOT_FOUND`, `METHOD_NOT_ALLOWED`, or `HTTP_ERROR`. Unknown observation is a
 successful state resource with explicit uncertainty, not a fabricated HTTP error.
 
+## Capabilities and software versions
+
+`GET /v1/capabilities` advertises only implemented and enabled features. It
+carries semantic contract versions (`result_contract_version`,
+`backend_contract_version`) and, separately, the software versions the node
+actually runs, under `backend_software`:
+
+```json
+"backend_software": {
+  "method": "read-only local AMI reads; no node targeting and no control dispatch",
+  "asterisk": {"version": "22.5.2", "detected": true, "source": "ami:CoreSettings/AsteriskVersion"},
+  "app_rpt": {"version": "1.2.3", "detected": true, "source": "ami:Command/rpt show version"}
+}
+```
+
+`backend_software_version` and `backend_software_version_detected` are the flat
+mirror of `backend_software.app_rpt`: the installed app_rpt this API controls.
+They report `null` and `false` whenever the version was not read, and are never
+derived from a contract or adapter version.
+
+Detection uses only bounded read-only AMI reads against the local Asterisk:
+
+- `Action: CoreSettings` — a native AMI action; `AsteriskVersion` is the running
+  Asterisk build (needs the AMI `system` or `reporting` read class).
+- `Action: Command` with the constant text `rpt show version` — app_rpt's own
+  version command, which only prints `app_rpt version: <major>.<minor>.<patch>`
+  (needs the AMI `command` class). The command text is a module constant; no
+  request field, node number, or configured node can influence it.
+
+Neither read targets a node, changes node state, or crosses the ledger's
+dispatch boundary; a capabilities request cannot dispatch control. The on-air
+`status 3` announcement is deliberately not used for discovery: it transmits.
+
+Failures are explicit and per-component. If the probe cannot complete, if AMI
+refuses it, or if a response is missing, repeated, or shaped differently than
+the parsers accept, the affected entry reports `version: null` with
+`detected: false`. Nothing is inferred from a partial answer, and one unknown
+component does not make the other unknown if its own evidence was usable.
+`/v1/capabilities` itself still returns `200`; it does not fail because the
+node could not be asked. A version is never guessed or fabricated.
+
 ## Backend source evidence
 
 Parsing and command mappings were checked against the upstream sources during
@@ -130,5 +173,9 @@ implementation; compatibility remains conservative when wire formats differ:
 - [Native RptStatus/XStat](https://github.com/AllStarLink/app_rpt/blob/master/apps/app_rpt/rpt_manager.c)
 - [ALINKS construction and truncation markers](https://github.com/AllStarLink/app_rpt/blob/master/apps/app_rpt/rpt_link.c)
 - [ilink and announcement semantics](https://github.com/AllStarLink/app_rpt/blob/master/apps/app_rpt/rpt_functions.c)
+- [app_rpt version command, `rpt show version`](https://github.com/AllStarLink/app_rpt/blob/master/apps/app_rpt/rpt_cli.c)
+  (RptStatus itself exposes only `RptStat`, `NodeStat`, `XStat`, `SawStat`; it
+  has no version command, so no native RptStatus version read exists)
+- [AMI `CoreSettings` (`AsteriskVersion`) and `Command` response shapes](https://github.com/asterisk/asterisk/blob/master/main/manager.c)
 
 No live-node or RF validation is part of the offline test suite.

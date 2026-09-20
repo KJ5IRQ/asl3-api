@@ -4,6 +4,7 @@ import logging
 import sqlite3
 from pathlib import Path
 
+from . import software
 from .ledger import ControlOwner, Ledger
 from .models import ProblemError, command_for, validate_node
 from .observation import Observer
@@ -151,6 +152,34 @@ class Platform:
                 "Operation persistence requires service recovery.",
             )
         return self.ledger
+
+    async def software_evidence(self) -> dict:
+        """Read-only Asterisk/app_rpt version evidence for capabilities.
+
+        Never raises and never guesses: if the probe cannot complete, or the
+        node answers with something unusable, both versions are reported as
+        not detected instead of being inferred. This path is read-only; it does
+        not touch the ledger, the owner lock, or the control dispatch boundary.
+        """
+        try:
+            asterisk, app_rpt = await self.transport.software_versions()
+        except (
+            OSError,
+            asyncio.TimeoutError,
+            asyncio.IncompleteReadError,
+            asyncio.LimitOverrunError,
+            ProtocolError,
+            ValueError,
+        ) as exc:
+            # Best-effort evidence: an unreachable or unusable node reports
+            # unknown versions, and capabilities still answers.
+            logger.warning(
+                "Backend software version probe failed; versions remain "
+                "unknown (%r)",
+                exc,
+            )
+            return software.undetected()
+        return software.evidence(asterisk, app_rpt)
 
     def admit(
         self,

@@ -292,6 +292,10 @@ def install_api(
             "unlink_all",
             "announce",
         ]
+        # Read-only version evidence. Unavailable or malformed evidence stays
+        # explicitly undetected; it is never inferred from a contract version.
+        software_evidence = await runtime.software_evidence()
+        app_rpt = software_evidence["app_rpt"]
         return {
             "node": config.node_number,
             "api_version": "1",
@@ -302,8 +306,13 @@ def install_api(
             "backend_contract_version": (
                 runtime.transport.contract_version
             ),
-            "backend_software_version": None,
-            "backend_software_version_detected": False,
+            # Mirror of backend_software.app_rpt: the installed app_rpt this
+            # API controls. null/false when it could not be read.
+            "backend_software_version": app_rpt["version"],
+            "backend_software_version_detected": (
+                app_rpt["detected"]
+            ),
+            "backend_software": software_evidence,
             "observation": {
                 "source": "RptStatus/XStat+SawStat",
                 "fresh_per_request": True,

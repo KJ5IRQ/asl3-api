@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
+from vnext import software
 from vnext.api import install_api
 from vnext.models import Operation, now
 
@@ -53,6 +54,12 @@ class FakeRuntime:
         self.policy = FakePolicy()
         self.ledger = FakeLedger()
         self.admissions = []
+        self.software = software.undetected()
+        self.software_probes = 0
+
+    async def software_evidence(self):
+        self.software_probes += 1
+        return self.software
 
     def require_ledger(self):
         return self.ledger
@@ -181,3 +188,61 @@ def test_operation_lookup_uses_same_durable_resource():
     )
     assert fetched.status_code == 200
     assert fetched.json()["id"] == operation_id
+
+
+def capabilities(client):
+    return client.get(
+        "/v1/capabilities",
+        headers={"X-API-Key": TEST_API_KEY},
+    )
+
+
+def test_capabilities_report_detected_backend_software_versions():
+    client, runtime = build_client()
+    runtime.software = software.evidence(
+        {"response": "Success", "asteriskversion": "22.5.2"},
+        {"response": "Success", "output": "app_rpt version: 1.2.3"},
+    )
+    response = capabilities(client)
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["backend_software"]["asterisk"] == {
+        "version": "22.5.2",
+        "detected": True,
+        "source": "ami:CoreSettings/AsteriskVersion",
+    }
+    assert data["backend_software"]["app_rpt"] == {
+        "version": "1.2.3",
+        "detected": True,
+        "source": "ami:Command/rpt show version",
+    }
+    # The flat fields are a mirror of the app_rpt entry, so they cannot drift.
+    assert (
+        data["backend_software_version"]
+        == data["backend_software"]["app_rpt"]["version"]
+    )
+    assert (
+        data["backend_software_version_detected"]
+        is data["backend_software"]["app_rpt"]["detected"]
+    )
+    # Contract versions stay distinct from software versions.
+    assert data["result_contract_version"] == "1.0"
+    assert data["backend_contract_version"] == "fake/1"
+    assert runtime.software_probes == 1
+    assert runtime.admissions == []
+
+
+def test_capabilities_report_unknown_versions_without_inventing_one():
+    client, runtime = build_client()
+    data = capabilities(client).json()
+
+    assert data["backend_software_version"] is None
+    assert data["backend_software_version_detected"] is False
+    for component in ("asterisk", "app_rpt"):
+        entry = data["backend_software"][component]
+        assert entry["version"] is None
+        assert entry["detected"] is False
+        assert entry["source"]
+    assert data["backend_software"]["method"]
+    assert runtime.admissions == []

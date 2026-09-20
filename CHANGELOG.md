@@ -12,6 +12,12 @@
   disabled DTMF/macro behavior remain covered.
 - Default bind is loopback; query credentials are a legacy-only explicit opt-in.
   Baseline events need no external scripts.
+- Report installed backend software versions in `/v1/capabilities`
+  (`backend_software`, plus the `backend_software_version` mirror) from bounded
+  read-only local AMI reads: native `CoreSettings` for Asterisk and app_rpt's own
+  `rpt show version` for app_rpt. No node targeting, no dispatch barrier, and no
+  on-air announcement. Unavailable or malformed evidence stays explicitly
+  undetected instead of being inferred from a contract version.
 - Document indefinite idempotency retention and effect/dispatch uncertainty; add
   fault-focused offline tests. No new runtime dependencies.
 

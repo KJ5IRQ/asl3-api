@@ -3,7 +3,8 @@
 A local REST API for observing and controlling one configured AllStarLink node.
 The canonical contract is `/v1`; interactive schemas are at `/docs` and
 `/openapi.json`. The legacy `/version` continues to report `1.4.2` for existing
-clients; use `/v1/capabilities` for backend and result-contract versions.
+clients; use `/v1/capabilities` for contract versions and the installed
+Asterisk/app_rpt software versions the node reports.
 
 The API binds to `127.0.0.1:8073` by default. Authenticate with `X-API-Key`.
 Remote clients should connect through a VPN (Tailscale/WireGuard) or a TLS
@@ -14,7 +15,7 @@ reverse proxy. AMI remains private. See [security](docs/SECURITY.md).
 | Method | Path | Authority | Meaning |
 |---|---|---|---|
 | GET | `/v1/node/state` | observe | Fresh native AMI XStat observation |
-| GET | `/v1/capabilities` | observe | Implemented/enabled features and contract versions |
+| GET | `/v1/capabilities` | observe | Implemented/enabled features, contract versions, installed software versions |
 | GET | `/v1/directory/{node}` | observe | Cached public metadata; absence does not invalidate a target |
 | GET | `/v1/operations` | observe | Durable operations, newest first; `limit` and `offset` |
 | GET | `/v1/operations/{id}` | observe | Dispatch and effect states, including uncertainty |

@@ -9,6 +9,7 @@ or external service is involved in operation dispatch.
 | `vnext/models.py` | Public state/operation schemas and fixed command mapping |
 | `vnext/api.py` | Named credential authority, REST/SSE, problem responses |
 | `vnext/observation.py` | Fresh XStat snapshots and strict ALINKS parsing |
+| `vnext/software.py` | Read-only Asterisk/app_rpt version evidence for capabilities |
 | `vnext/transport.py` | Separate one-shot AMI observation/control sessions |
 | `vnext/ledger.py` | SQLite transactions, idempotency, OS lock, crash recovery |
 | `vnext/service.py` | Admission, serialization, durable barrier, effect observation |
@@ -40,6 +41,14 @@ mistaken for responses from an earlier connection. A serialized observer rejects
 in-flight results after lifecycle invalidation. Both the v1 SSE resource and
 legacy events use these snapshots; UserEvent payloads and external shell scripts
 are not authoritative. Snapshot cadence may miss short transitions.
+
+`/v1/capabilities` reports the installed Asterisk and app_rpt versions from a
+separate bounded read-only probe (`vnext/software.py`): native `CoreSettings`
+plus app_rpt's own `rpt show version`. The probe carries no node argument and no
+dispatch barrier, opens no ledger transaction, and is never on the control path.
+Unusable evidence degrades that component to `detected: false` instead of a
+guess, and the resource still answers `200`. See
+[v1 semantics](VNEXT.md#capabilities-and-software-versions).
 
 See [v1 semantics](VNEXT.md) for state/effect distinctions, recovery, retention,
 source references, and the exact limitations of the result contract.

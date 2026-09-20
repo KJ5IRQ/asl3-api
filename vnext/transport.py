@@ -8,6 +8,8 @@ import asyncio
 from contextlib import asynccontextmanager
 from uuid import uuid4
 
+from .software import APP_RPT_VERSION_ACTION, ASTERISK_VERSION_ACTION
+
 
 class ProtocolError(Exception):
     pass
@@ -142,6 +144,25 @@ class AMITransport:
                 timeout=self.timeout,
             )
             return xstat, sawstat, session.epoch
+
+    async def software_versions(self) -> tuple[dict, dict]:
+        """Read-only version probe in one AMI session.
+
+        The two reads below are constants: they carry no node argument, no
+        dispatch barrier, and no control write. The whole probe shares the
+        single AMI timeout, so it cannot outlive normal observation bounds.
+        """
+        async def probe():
+            async with self.session() as session:
+                asterisk = await session.action(
+                    dict(ASTERISK_VERSION_ACTION)
+                )
+                app_rpt = await session.action(
+                    dict(APP_RPT_VERSION_ACTION)
+                )
+                return asterisk, app_rpt
+
+        return await asyncio.wait_for(probe(), timeout=self.timeout)
 
     async def dispatch(self, command: str, before_write) -> dict:
         """Send one control action once. No reconnect or replay exists here."""
