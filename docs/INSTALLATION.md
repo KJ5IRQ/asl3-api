@@ -31,7 +31,8 @@ sudo mkdir -p /opt/asl3-api
 sudo chown $(whoami):$(whoami) /opt/asl3-api
 
 # Copy source files
-cp asl_agent.py ami_client.py config.py event_handler.py node_cache.py requirements.txt /opt/asl3-api/
+cp asl_agent.py ami_client.py ami_event_listener.py config.py event_handler.py node_cache.py requirements.txt /opt/asl3-api/
+cp -R vnext /opt/asl3-api/
 cp config.yaml.example /opt/asl3-api/
 ```
 
@@ -218,7 +219,7 @@ curl -H "X-API-Key: YOUR_API_KEY" http://localhost:8073/status
 
 ## Accessing from Your LAN
 
-By default the API binds to `0.0.0.0:8073`, so it is accessible from any device on your network at `http://your-pi-ip:8073`.
+By default the API binds to `127.0.0.1:8073`. Use a VPN or TLS reverse proxy for remote access. Review `api.host` explicitly when upgrading an older installation.
 
 To find your Pi's IP:
 
@@ -237,7 +238,8 @@ To upgrade to a newer version:
 ```bash
 cd ~/asl3-api          # wherever you cloned the repo
 git pull
-cp asl_agent.py ami_client.py config.py event_handler.py node_cache.py requirements.txt /opt/asl3-api/
+cp asl_agent.py ami_client.py ami_event_listener.py config.py event_handler.py node_cache.py requirements.txt /opt/asl3-api/
+cp -R vnext /opt/asl3-api/
 
 cd /opt/asl3-api
 source venv/bin/activate
@@ -267,3 +269,15 @@ Remove the `[asl3-api]` block from `/etc/asterisk/manager.conf` and reload:
 sudo nano /etc/asterisk/manager.conf
 sudo asterisk -rx "manager reload"
 ```
+
+## vNext migration
+
+Review [v1 semantics](VNEXT.md) before migrating controls: legacy active control
+routes now return 202 and an operation Location. Named credentials are supported;
+see config.yaml.example. No rpt.conf event shell scripts are required.
+
+Use one process/worker for the configured node. The service creates private
+`/opt/asl3-api/state` for SQLite and the owner lock. All instances for that node
+must share `operations.lock_directory`. Preserve the database and its WAL when
+backing up; do not remove active lock files. The default service starts the
+Python entrypoint so the YAML bind address is honored.

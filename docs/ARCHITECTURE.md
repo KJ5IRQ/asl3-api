@@ -1,250 +1,45 @@
 # Architecture
 
-## Overview
+The v1 API is implemented in the `vnext/` package and installed into the existing
+FastAPI application. It needs Python, AMI, and local SQLite; no ORM, Redis, broker,
+or external service is involved in operation dispatch.
 
-ASL3-API is a FastAPI application that runs on your AllStar node's Raspberry Pi.
-It translates HTTP REST requests into Asterisk Manager Interface (AMI) commands,
-listens for AMI events pushed by app_rpt, and delivers live state to clients via
-Server-Sent Events (SSE).
+| Module | Responsibility |
+|---|---|
+| `vnext/models.py` | Public state/operation schemas and fixed command mapping |
+| `vnext/api.py` | Named credential authority, REST/SSE, problem responses |
+| `vnext/observation.py` | Fresh XStat snapshots and strict ALINKS parsing |
+| `vnext/transport.py` | Separate one-shot AMI observation/control sessions |
+| `vnext/ledger.py` | SQLite transactions, idempotency, OS lock, crash recovery |
+| `vnext/service.py` | Admission, serialization, durable barrier, effect observation |
+| `ami_event_listener.py` | Legacy SSE adapter over canonical snapshots |
+| `ami_client.py` | Legacy observation compatibility and blocked old control helpers |
+| `node_cache.py` | Public metadata cache, never target authorization |
 
-```
-Browser / App / MCP Client
-        |
-        | REST (control + snapshots)     SSE (live events)
-        | X-API-Key header               ?api_key= query param
-        |
-ASL3-API  (FastAPI + uvicorn, port 8073, Raspberry Pi)
-        |
-        +-- node_cache.py       (allmondb, refreshed every 15 min)
-        +-- ami_event_listener  (persistent event subscriber + SSE broadcast)
-        +-- event_handler.py    (5s fallback poll, webhook delivery)
-        |
-        | panoramisk — persistent TCP connection to port 5038
-        | Two streams on same connection:
-        |   Action/Response  (REST-triggered commands)
-        |   Unsolicited Events  (app_rpt UserEvents)
-        |
-Asterisk / ASL3  (app_rpt)
-        |
-        +-- AMI UserEvents (injected by rpt.conf [events] shell scripts)
-        |     rxkeyed_true / rxkeyed_false
-        |     txkeyed_true / txkeyed_false
-        |
-        +-- app_rpt ilink / cop / rpt commands
-        |
-AllStar Link network
-```
+Admission commits a QUEUED operation. An in-process async lock serializes its
+execution. A dedicated session authenticates, the operation commits
+DISPATCH_STARTED, and the transport writes one fixed command once. The transport
+contains no reconnect or replay path. It correlates replies by ActionID and
+rejects malformed framing. Acknowledgment and effect are recorded separately;
+link effect checks use subsequent fresh native snapshots.
 
-## Event Flow: How Live RX/TX State Reaches a Browser
+The OS advisory lock is held throughout the runtime, including recovery and
+shutdown. Recovery runs before any network connection. Ledger updates are short,
+synchronous transactions so there is no scheduling gap between the dispatch
+commit and the control write. The service must run with a local filesystem and
+one worker; all instances for a node must share the lock directory.
 
-```
-Operator keys mic
-    |
-    RF input to node radio
-    |
-app_rpt sets RPT_RXKEYED = 1
-    |
-    rpt.conf [events] fires:
-    /usr/local/sbin/asl3-event-rxkeyed-true
-    |
-    asterisk -rx "manager userevent ASL3Event|EventName: rxkeyed_true|Node: 637050"
-    |
-AMI pushes UserEvent over TCP to panoramisk
-    |
-ami_event_listener._on_user_event() callback fires
-    |
-ami_event_listener.broadcast() puts event in every SSE client queue
-    |
-/events generator yields:
-    event: node.rxkeyed
-    data: {"type":"node.rxkeyed","rxkeyed":true,"node":"637050",...}
-    |
-Browser EventSource receives event in <100ms
-```
+Panoramisk remains only on the legacy observation connection. Its reconnect
+behavior cannot replay v1 controls, and the old generic command method rejects
+anything outside its observation allowlist. Legacy HTTP controls map to the v1
+operation service. H1 mapping tests inject a fake command boundary explicitly;
+transport/ledger tests verify the production dispatch boundary independently.
 
-Without the rpt.conf configuration, RX/TX state is still delivered via the
-5-second fallback poll in `ami_event_listener._fallback_poll_loop()`, but with
-up to 5 seconds of latency. The UserEvent path delivers sub-100ms.
+Each native observation opens an independent AMI session, so events cannot be
+mistaken for responses from an earlier connection. A serialized observer rejects
+in-flight results after lifecycle invalidation. Both the v1 SSE resource and
+legacy events use these snapshots; UserEvent payloads and external shell scripts
+are not authoritative. Snapshot cadence may miss short transitions.
 
-## Components
-
-### `asl_agent.py` — FastAPI Application
-
-Entry point and HTTP layer. Responsibilities:
-
-- Validates config on startup before binding the port
-- Connects to AMI, starts node cache, event listener, event handler
-- Validates API keys on every protected request (header or query param)
-- Enforces per-IP rate limits on control endpoints via slowapi
-- Validates all request bodies
-- Delegates all AMI operations to `ami_client`
-- Delegates lookups to `node_cache`
-- Writes timestamped structured entries to the audit log
-- Streams SSE events from `ami_event_listener` to clients
-
-### `ami_client.py` — AMI Client
-
-All AMI communication. Uses panoramisk for async AMI over TCP.
-
-| Operation | AMI Command |
-|-----------|-------------|
-| Get node stats | `rpt stats {node}` |
-| Get node variables | `rpt show variables {node}` |
-| Get connected nodes | `rpt nodes {node}` |
-| Connect (transceive) | `rpt cmd {node} ilink 3 {remote}` |
-| Connect (monitor) | `rpt cmd {node} ilink 2 {remote}` |
-| Disconnect one node | `rpt cmd {node} ilink 1 {remote}` |
-| Disconnect all | `rpt cmd {node} ilink 6` |
-| Force ID | `rpt cmd {node} status 1` |
-| Say time | `rpt cmd {node} status 2` |
-| Say version | `rpt cmd {node} status 3` |
-| Say system status | `rpt cmd {node} ilink 5` |
-| AMI health check | `Ping` action |
-
-No COP command is issued by any endpoint. Through 1.4.1 the four announcement
-endpoints issued COP 10/12/13/14 — verified against `AllStarLink/app_rpt`
-(`apps/app_rpt/rpt_functions.c`, `function_cop`) to be *autopatch disable*,
-*link disable*, *query system control state* and *change system control state*.
-They were corrected in 1.4.2 to the `status` and `ilink` functions above.
-
-### DTMF and macros — deliberately not implemented
-
-| Operation | Broken command (≤1.4.1) | Why it never worked | Working command |
-|-----------|-------------------------|---------------------|-----------------|
-| Send DTMF | `rpt cmd {node} senddigits {seq}` | `senddigits` is absent from app_rpt's `function_table`; `rpt_function_lookup()` fails and app_rpt answers `Unknown action name senddigits.` | `rpt fun {node} {digits}` |
-| Execute macro | `rpt cmd {node} cop 6 {macro}` | COP 6 is *Simulate COR being activated (phone only)* and returns `DC_INDETERMINATE` unless `command_source` is `SOURCE_PHONE`; `rpt cmd` always sets `SOURCE_RPT` | `rpt cmd {node} macro {n} {macro}` |
-
-`ami_client` never inspected the AMI response, so both reported success for
-operations that did not run.
-
-The working commands are **not** wired up. Both inject into the node's own DTMF
-function decoder, so their effect is whatever that node's `rpt.conf`
-`[functions]` / `[macro]` stanzas define — up to and including link control and
-control-operator state changes. They stay unavailable (HTTP 503) until policy
-gating exists.
-
-### `ami_event_listener.py` — SSE Event Broadcaster
-
-Persistent AMI subscriber and SSE fan-out. Key behaviours:
-
-- Registers a panoramisk callback for `UserEvent` events on startup
-- Filters for `UserEvent == ASL3Event` and `EventName` field
-- Broadcasts structured JSON to all subscribed SSE client queues
-- Each SSE client gets its own `asyncio.Queue(maxsize=200)`
-- Slow clients that fill their queue are silently dropped (does not block others)
-- Fallback poll loop runs every 5s for link connect/disconnect and variable snapshots
-- Reconnect-with-backoff if AMI connection is lost
-
-### `event_handler.py` — Webhook Delivery + Fallback Poll
-
-Complementary to `ami_event_listener`. Runs the 5-second poll loop for node
-connect/disconnect detection and optionally delivers webhooks to external URLs.
-Also broadcasts to SSE via `ami_event_listener` to avoid duplication.
-
-### `config.py` — Configuration
-
-Loads `config.yaml` on startup. Dot-notation property accessors. Validates
-required fields before the server binds its port.
-
-### `node_cache.py` — AllStar Node Database
-
-Fetches allmondb.allstarlink.org on startup, holds 39,000+ nodes in memory,
-refreshes every 15 minutes. All `/lookup` and `?enrich=true` calls are served
-from this cache -- no per-request external HTTP.
-
-## Request / Event Flows
-
-### REST: Connect to a node
-
-```
-POST /connect  {"node": "55553"}  X-API-Key: ...
-    → auth validated
-    → body validated (node must be numeric)
-    → ami_client.connect_node("55553", False)
-    → AMI: rpt cmd 637050 ilink 3 55553
-    → poll every 1s up to 12s for node to appear in rpt nodes
-    → audit log entry written
-    → {"success": true, "node": "55553", "mode": "transceive"}
-```
-
-### SSE: Browser receives live keyed event
-
-```
-GET /events?api_key=...
-    → api_key validated
-    → initial variable snapshot sent immediately
-    → generator blocks on queue.get(timeout=15)
-    → operator keys mic
-    → rpt.conf fires shell script → AMI UserEvent → listener → broadcast
-    → queue.get() returns event
-    → generator yields SSE frame
-    → browser EventSource fires event listener in <100ms
-```
-
-## API Endpoint Summary
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | /ping | None | Health check, AMI status |
-| GET | /version | None | Version, cache status |
-| GET | /status | Header | Node stats (uptime, keyups, TX time) |
-| GET | /nodes | Header | Connected node list |
-| GET | /variables | Header | Live app_rpt variables |
-| GET | /capabilities | Header | Node and API capabilities (MCP-friendly) |
-| GET | /lookup/{node} | Header | Node callsign/location from cache |
-| GET | /events | Query param | SSE live event stream |
-| POST | /connect | Header | Connect to remote node |
-| POST | /disconnect | Header | Disconnect specific node |
-| POST | /disconnect-all | Header | Disconnect all nodes |
-| POST | /dtmf | Header | Disabled since 1.4.2 — always 503 |
-| POST | /macro | Header | Disabled since 1.4.2 — always 503 |
-| POST | /cop/identify | Header | Force node ID (`status 1`) |
-| POST | /cop/time | Header | Say current time (`status 2`) |
-| POST | /cop/status | Header | Say system status (`ilink 5`) |
-| POST | /cop/version | Header | Say app_rpt version (`status 3`) |
-| GET | /audit | Header | Recent audit log entries (structured) |
-
-## SSE Event Reference
-
-All events include `type`, `timestamp` (ISO 8601 UTC), `node`, `callsign`.
-
-| Event type | Additional fields | Source |
-|-----------|-------------------|--------|
-| `node.rxkeyed` | `rxkeyed: bool`, `node_number: str` | AMI UserEvent (rpt.conf required) |
-| `node.txkeyed` | `txkeyed: bool`, `node_number: str` | AMI UserEvent (rpt.conf required) |
-| `node.variables.snapshot` | `variables: object` | Periodic poll (every 10s) |
-| `link.connected` | `connected_node: str`, `mode: str` | 5s fallback poll |
-| `link.disconnected` | `disconnected_node: str` | 5s fallback poll |
-| `health.ami` | `connected: bool` | AMI connection monitor |
-
-## manager.conf Requirements
-
-The `[asl3-api]` AMI user block must include `user` in the read class list
-for UserEvents to be delivered:
-
-```ini
-[asl3-api]
-secret = YOUR_PASSWORD
-read = system,call,reporting,command,user
-write = command,reporting
-deny = 0.0.0.0/0.0.0.0
-permit = 127.0.0.1/255.255.255.255
-```
-
-Without `user` in the read list, the AMI connection works for REST commands
-but UserEvents are silently filtered by Asterisk and never reach the listener.
-Only the fallback 5-second poll will provide events in that case.
-
-## nginx Proxy Note
-
-If you place nginx in front of uvicorn, add this to your location block
-to prevent SSE stream buffering:
-
-```nginx
-proxy_set_header X-Accel-Buffering no;
-proxy_buffering off;
-proxy_cache off;
-```
-
-Without this, nginx buffers the event stream and clients may wait seconds
-or minutes before receiving events.
+See [v1 semantics](VNEXT.md) for state/effect distinctions, recovery, retention,
+source references, and the exact limitations of the result contract.

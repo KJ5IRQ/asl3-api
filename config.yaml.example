@@ -23,19 +23,34 @@ node:
 # API server
 # ---------------------------------------------------------------------------
 api:
-  host: "0.0.0.0"        # Listen on all interfaces; restrict with firewall
+  host: "127.0.0.1"      # Remote use: VPN or authenticated TLS reverse proxy
   port: 8073
-  api_key: ""            # Generate with: openssl rand -base64 32
+  api_key: ""            # Legacy single header key, used only when credentials is empty
+  # Named credentials; control also permits observation. Generate distinct secrets.
+  credentials: []
+  # credentials:
+  #   - name: dashboard
+  #     key: "GENERATE-A-SECRET"
+  #     authority: [observe]
+  #   - name: operator
+  #     key: "GENERATE-A-DIFFERENT-SECRET"
+  #     authority: [observe, control]
+  allow_legacy_query_key: false  # Only affects legacy /events; v1 is header-only
+
+# Local durable state; all instances controlling this node MUST share lock_directory.
+# Keep this directory private to the service account, on a local filesystem.
+operations:
+  state_directory: "/opt/asl3-api/state"
+  lock_directory: "/opt/asl3-api/state"
+  dispatch_timeout: 5
+  effect_timeout: 8
+  # Operations and Idempotency-Key bindings are retained indefinitely.
 
 # ---------------------------------------------------------------------------
 # SSE Event Stream
-# When enabled, browsers and apps can connect to GET /events?api_key=KEY
-# and receive live node state updates (RX keyed, TX keyed, link changes).
-#
-# IMPORTANT: For rxkeyed/txkeyed events to work, you must also configure
-# the rpt.conf [events] stanza on your node. See INSTALLATION.md for
-# the required shell scripts and rpt.conf additions. Without that step,
-# only link connect/disconnect events and periodic snapshots are emitted.
+# GET /v1/events uses X-API-Key and periodic native RptStatus/XStat snapshots.
+# No external rpt.conf event shell scripts are required. A snapshot may explicitly
+# report STATE_UNKNOWN; missed transitions are not reconstructed or replayed.
 # ---------------------------------------------------------------------------
 events:
   enabled: true

@@ -9,9 +9,8 @@ When a change is detected, it:
 Webhooks are disabled by default. To enable, set webhooks.enabled: true
 in config.yaml and provide a webhooks.url endpoint.
 
-Note: Polling is the fallback for link connect/disconnect events only.
-RX/TX keyed events are delivered via the AMI UserEvent listener which
-requires the rpt.conf [events] configuration. See INSTALLATION.md.
+Node changes derive from native XStat through AMIClient. Incomplete snapshots
+raise STATE_UNKNOWN and never become an empty connected-node list.
 """
 import asyncio
 import logging

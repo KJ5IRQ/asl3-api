@@ -1,3 +1,12 @@
+# Historical event scripts — not required by vNext
+
+These scripts are retained as historical artifacts. Current state and events
+come from native RptStatus/XStat snapshots, without shell scripts or an rpt.conf
+events stanza. Do not install these to enable v1 observations. The historical
+instructions below do not describe the current event adapter.
+
+---
+
 # rpt_events — Shell Scripts for app_rpt Event Integration
 
 These scripts are called by the app_rpt [events] subsystem in `rpt.conf` when

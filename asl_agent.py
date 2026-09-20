@@ -15,11 +15,14 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from ami_client import CommandRejected, ami_client
+from ami_client import ami_client
 from ami_event_listener import AMIEventListener
 from config import config
 from event_handler import EventHandler
 from node_cache import node_cache
+from vnext.api import authenticate, install_api, problem_response
+from vnext.models import ProblemError
+from vnext.service import Platform
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -56,35 +59,31 @@ async def lifespan(app: FastAPI):
         logger.critical(str(e))
         raise
 
-    await ami_client.connect()
-    await event_handler.start()
-    await node_cache.start()
-    await ami_event_listener.start()
-
-    if config.webhooks_enabled:
-        _monitoring_task = asyncio.create_task(event_handler.monitoring_loop())
-        logger.info("Webhook monitoring loop started")
-
-    logger.info(
-        f"ASL3-API ready — node {config.node_number} ({config.node_callsign})"
-        f" on {config.api_host}:{config.api_port}"
-    )
-
-    yield
-
-    logger.info("ASL3-API shutting down...")
-    if _monitoring_task:
-        _monitoring_task.cancel()
+    runtime = Platform(config)
+    runtime.start()  # Acquire the node owner before opening any AMI connection.
+    app.state.platform = runtime
+    try:
+        ami_client.observer = runtime.observer
         try:
-            await _monitoring_task
-        except asyncio.CancelledError:
-            pass
-
-    await ami_event_listener.stop()
-    await event_handler.stop()
-    await node_cache.stop()
-    await ami_client.disconnect()
-    logger.info("ASL3-API stopped")
+            await ami_client.connect()
+        except Exception:
+            logger.exception("Legacy AMI connection unavailable; v1 remains available with fresh probes")
+        await event_handler.start()
+        await node_cache.start()
+        await ami_event_listener.start()
+        if config.webhooks_enabled:
+            _monitoring_task = asyncio.create_task(event_handler.monitoring_loop())
+        yield
+    finally:
+        await runtime.close()
+        if _monitoring_task:
+            _monitoring_task.cancel()
+            await asyncio.gather(_monitoring_task, return_exceptions=True)
+            _monitoring_task = None
+        await ami_event_listener.stop()
+        await event_handler.stop()
+        await node_cache.stop()
+        await ami_client.disconnect()
 
 
 # ---------------------------------------------------------------------------
@@ -105,49 +104,50 @@ app = FastAPI(
 )
 
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+async def rate_limit_handler(request, exc):
+    if request.url.path.startswith("/v1/"):
+        return problem_response(request, 429, "RATE_LIMITED", "Request rate limit exceeded.")
+    return _rate_limit_exceeded_handler(request, exc)
+
+
+app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
+install_api(app, config, node_cache, limiter)
 
 # ---------------------------------------------------------------------------
 # Authentication
 # ---------------------------------------------------------------------------
 
 
-async def verify_api_key(x_api_key: str = Header(...)):
-    """Validate the X-API-Key header on every protected endpoint."""
-    if not config.api_key:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="API key not configured on server",
-        )
-    if x_api_key != config.api_key:
-        logger.warning("Rejected request with invalid API key")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API key",
-        )
-    return x_api_key
+async def verify_api_key(request: Request, x_api_key: str = Header(...)):
+    """Legacy routes share the named credential authority checks."""
+    authority = "control" if request.method in {"POST", "DELETE"} else "observe"
+    return authenticate(config, x_api_key, authority)
 
 
-async def verify_api_key_query(api_key: str = Query(..., alias="api_key")):
-    """
-    Query-parameter API key validation for SSE endpoints.
+async def verify_api_key_query(
+    x_api_key: str | None = Header(None), api_key: str | None = Query(None),
+):
+    """Query secrets are an explicit legacy opt-in; headers work by default."""
+    key = x_api_key
+    if key is None and config.get("api.allow_legacy_query_key", False):
+        key = api_key
+    return authenticate(config, key, "observe")
 
-    The browser EventSource API does not support custom headers, so the
-    /events endpoint accepts ?api_key= as an alternative to X-API-Key.
-    Both are validated against the same configured secret.
-    """
-    if not config.api_key:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="API key not configured on server",
-        )
-    if api_key != config.api_key:
-        logger.warning("Rejected SSE request with invalid api_key query param")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API key",
-        )
-    return api_key
+
+def legacy_operation(request: Request, kind: str, body: dict):
+    """Compatibility paths use the same durable, non-replaying v1 boundary."""
+    from fastapi.responses import JSONResponse
+
+    runtime = getattr(request.app.state, "platform", None)
+    if runtime is None:
+        raise ProblemError(503, "CONTROL_UNAVAILABLE", "The local runtime has not started.")
+    credential = authenticate(config, request.headers.get("X-API-Key"), "control")
+    key = request.headers.get("Idempotency-Key")
+    if key is not None and not re.fullmatch(r"[!-~]{1,128}", key):
+        raise ProblemError(422, "INVALID_REQUEST", "Invalid Idempotency-Key.")
+    operation = runtime.admit(kind, body, credential, key)
+    return JSONResponse(status_code=202, content=operation.model_dump(),
+                        headers={"Location": f"/v1/operations/{operation.id}"})
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +181,7 @@ class ConnectRequest(BaseModel):
     @field_validator("node")
     @classmethod
     def node_must_be_numeric(cls, v: str) -> str:
-        if not re.fullmatch(r"\d+", v):
+        if not re.fullmatch(r"[1-9][0-9]{0,5}", v):
             raise ValueError("Node number must contain only digits")
         return v
 
@@ -192,7 +192,7 @@ class DisconnectRequest(BaseModel):
     @field_validator("node")
     @classmethod
     def node_must_be_numeric(cls, v: str) -> str:
-        if not re.fullmatch(r"\d+", v):
+        if not re.fullmatch(r"[1-9][0-9]{0,5}", v):
             raise ValueError("Node number must contain only digits")
         return v
 
@@ -387,7 +387,7 @@ async def get_capabilities():
             ),
         },
         "endpoints": {
-            "events_stream": "/events?api_key=YOUR_KEY" if config.events_enabled else None,
+            "events_stream": "/events" if config.events_enabled else None,
             "rest_docs": "/docs",
             "redoc": "/redoc",
         },
@@ -418,7 +418,7 @@ async def lookup_node(node_number: str):
 
     The cache is refreshed every 15 minutes from allmondb.allstarlink.org.
     """
-    if not re.fullmatch(r"\d+", node_number):
+    if not re.fullmatch(r"[1-9][0-9]{0,5}", node_number):
         raise HTTPException(status_code=400, detail="Node number must contain only digits")
     return node_cache.lookup(node_number)
 
@@ -434,44 +434,10 @@ async def event_stream(
     api_key: str = Depends(verify_api_key_query),
 ):
     """
-    Server-Sent Events stream of live node state.
-
-    Connect with EventSource in a browser:
-        const es = new EventSource('/events?api_key=YOUR_KEY');
-        es.addEventListener('node.rxkeyed', e => console.log(JSON.parse(e.data)));
-
-    Or with curl:
-        curl -N 'http://node:8073/events?api_key=YOUR_KEY'
-
-    Events emitted (all include timestamp, node, callsign fields):
-
-      node.rxkeyed
-        rxkeyed: bool  — RF receiver keyed state changed
-        node_number: str
-
-      node.txkeyed
-        txkeyed: bool  — Transmitter keyed state changed
-        node_number: str
-
-      node.variables.snapshot
-        variables: object  — Full variable state snapshot (every 10s)
-
-      link.connected
-        connected_node: str  — Remote node just connected
-        mode: str            — T=transceive, R=receive-only
-
-      link.disconnected
-        disconnected_node: str  — Remote node just disconnected
-
-      health.ami
-        connected: bool  — AMI connection state changed
-
-    Keepalive comments are sent every 15 seconds to prevent proxy/browser
-    timeout on idle connections.
-
-    NOTE: If you are running nginx in front of this API, add
-    proxy_set_header X-Accel-Buffering no; to your location block,
-    or events will be buffered and not delivered in real time.
+    Legacy SSE snapshots and observed transitions. Authenticate with X-API-Key.
+    For the canonical resource, use GET /v1/events. Baseline observations use
+    native AMI XStat and require no external rpt.conf event scripts. Query-key
+    authentication is disabled unless api.allow_legacy_query_key is enabled.
     """
     if not config.events_enabled:
         raise HTTPException(
@@ -531,71 +497,22 @@ async def event_stream(
 @app.post("/connect", dependencies=[Depends(verify_api_key)], tags=["Control"])
 @limiter.limit(lambda: f"{config.rate_limit}/minute")
 async def connect_node(request: Request, body: ConnectRequest):
-    """
-    Connect to a remote AllStar node.
-
-    Set monitor_only=true for receive-only (RX) mode.
-    Connection verification polls every second up to connect_timeout seconds.
-    """
-    try:
-        mode = "monitor" if body.monitor_only else "transceive"
-        result = await ami_client.connect_node(body.node, body.monitor_only)
-        audit_log("connect", f"node={body.node} mode={mode}")
-
-        if not result.get("success"):
-            raise HTTPException(status_code=400, detail=result.get("error"))
-
-        return {
-            "success": True,
-            "message": f"Connected to node {body.node} in {mode} mode",
-            "node": body.node,
-            "mode": mode,
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"/connect error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    """Legacy alias: returns an asynchronous v1 operation and Location."""
+    return legacy_operation(request, "link_node", {"node": body.node, "mode": "monitor" if body.monitor_only else "transceive"})
 
 
 @app.post("/disconnect", dependencies=[Depends(verify_api_key)], tags=["Control"])
 @limiter.limit(lambda: f"{config.rate_limit}/minute")
 async def disconnect_node(request: Request, body: DisconnectRequest):
-    """
-    Disconnect from a specific remote node.
-
-    Disconnection verification polls every second up to disconnect_timeout seconds.
-    """
-    try:
-        result = await ami_client.disconnect_node(body.node)
-        audit_log("disconnect", f"node={body.node}")
-
-        if not result.get("success"):
-            raise HTTPException(status_code=400, detail=result.get("error"))
-
-        return {
-            "success": True,
-            "message": f"Disconnected from node {body.node}",
-            "node": body.node,
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"/disconnect error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    """Legacy alias: returns an asynchronous v1 operation and Location."""
+    return legacy_operation(request, "unlink_node", {"node": body.node})
 
 
 @app.post("/disconnect-all", dependencies=[Depends(verify_api_key)], tags=["Control"])
 @limiter.limit(lambda: f"{config.rate_limit}/minute")
 async def disconnect_all(request: Request):
-    """Drop all active node connections."""
-    try:
-        await ami_client.disconnect_all()
-        audit_log("disconnect-all")
-        return {"success": True, "message": "All node connections dropped"}
-    except Exception as e:
-        logger.error(f"/disconnect-all error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    """Legacy alias: returns an asynchronous v1 operation and Location."""
+    return legacy_operation(request, "unlink_all", {})
 
 
 def _capability_disabled(capability: str, detail: str, attempt: str) -> HTTPException:
@@ -685,83 +602,29 @@ async def execute_macro(request: Request, body: MacroRequest):
 @app.post("/cop/identify", dependencies=[Depends(verify_api_key)], tags=["Control"])
 @limiter.limit(lambda: f"{config.rate_limit}/minute")
 async def cop_identify(request: Request):
-    """
-    Force the node to identify over the air. app_rpt: status 1.
-
-    Fixed in 1.4.2. Previously issued COP 10, which disables autopatch.
-    """
-    try:
-        result = await ami_client.force_id()
-        audit_log("cop/identify", f"command={result['command']}")
-        return {"success": True, "message": "Node ID playback triggered"}
-    except CommandRejected as e:
-        logger.error(f"/cop/identify rejected: {e}")
-        raise HTTPException(status_code=502, detail=str(e))
-    except Exception as e:
-        logger.error(f"/cop/identify error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    """Legacy alias: returns an asynchronous v1 operation and Location."""
+    return legacy_operation(request, "announce", {"kind": "identify"})
 
 
 @app.post("/cop/time", dependencies=[Depends(verify_api_key)], tags=["Control"])
 @limiter.limit(lambda: f"{config.rate_limit}/minute")
 async def cop_time(request: Request):
-    """
-    Announce the current time over the air. app_rpt: status 2.
-
-    Fixed in 1.4.2. Previously issued COP 12, which disables link functions.
-    """
-    try:
-        result = await ami_client.say_time()
-        audit_log("cop/time", f"command={result['command']}")
-        return {"success": True, "message": "Time announcement triggered"}
-    except CommandRejected as e:
-        logger.error(f"/cop/time rejected: {e}")
-        raise HTTPException(status_code=502, detail=str(e))
-    except Exception as e:
-        logger.error(f"/cop/time error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    """Legacy alias: returns an asynchronous v1 operation and Location."""
+    return legacy_operation(request, "announce", {"kind": "time"})
 
 
 @app.post("/cop/status", dependencies=[Depends(verify_api_key)], tags=["Control"])
 @limiter.limit(lambda: f"{config.rate_limit}/minute")
 async def cop_status(request: Request):
-    """
-    Announce system/connection status over the air. app_rpt: ilink 5.
-
-    Fixed in 1.4.2. Previously issued COP 13, which announces the system
-    control state rather than connection status.
-    """
-    try:
-        result = await ami_client.say_status()
-        audit_log("cop/status", f"command={result['command']}")
-        return {"success": True, "message": "System status announcement triggered"}
-    except CommandRejected as e:
-        logger.error(f"/cop/status rejected: {e}")
-        raise HTTPException(status_code=502, detail=str(e))
-    except Exception as e:
-        logger.error(f"/cop/status error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    """Legacy alias: returns an asynchronous v1 operation and Location."""
+    return legacy_operation(request, "announce", {"kind": "status"})
 
 
 @app.post("/cop/version", dependencies=[Depends(verify_api_key)], tags=["Control"])
 @limiter.limit(lambda: f"{config.rate_limit}/minute")
 async def cop_version(request: Request):
-    """
-    Announce the app_rpt software version over the air. app_rpt: status 3.
-
-    Fixed in 1.4.2. Previously issued COP 14 with no argument, which changes
-    the system control state when given one and did nothing without one.
-    """
-    try:
-        result = await ami_client.say_version()
-        audit_log("cop/version", f"command={result['command']}")
-        return {"success": True, "message": "Version announcement triggered"}
-    except CommandRejected as e:
-        logger.error(f"/cop/version rejected: {e}")
-        raise HTTPException(status_code=502, detail=str(e))
-    except Exception as e:
-        logger.error(f"/cop/version error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    """Legacy alias: returns an asynchronous v1 operation and Location."""
+    return legacy_operation(request, "announce", {"kind": "version"})
 
 
 # ---------------------------------------------------------------------------

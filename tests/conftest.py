@@ -149,7 +149,7 @@ class FakeManager:
 
 
 @pytest.fixture
-def fake_manager():
+def fake_manager(monkeypatch):
     """A connected AMIClient backed by FakeManager. Yields the manager."""
     from ami_client import ami_client
 
@@ -159,6 +159,11 @@ def fake_manager():
     manager = FakeManager()
     ami_client.manager = manager
     ami_client.connected = True
+    # H1 command-mapping/refusal tests inject a fake send boundary. Production
+    # send_command is now observation-only; vNext tests cover real framing.
+    async def fake_command(command):
+        return await manager.send_action({"Action": "Command", "Command": command})
+    monkeypatch.setattr(ami_client, "send_command", fake_command)
     try:
         yield manager
     finally:

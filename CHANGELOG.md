@@ -1,3 +1,20 @@
+# Unreleased — ASL3 Remote Platform vNext
+
+- Add canonical `/v1` state, capabilities, directory, operations, SSE, link and
+  announcement resources with named header credentials and problem responses.
+- Replace canonical observation with strict native RptStatus/XStat and ALINKS
+  evidence. Missing, malformed, contradictory, or truncated data is unknown.
+- Add SQLite operation/idempotency ledger, commit-before-dispatch, restart
+  recovery, one local owner, serialized control and a non-replaying AMI transport.
+- Use exact ilink 11 unlink semantics, including permanent links.
+- Legacy active control routes intentionally change to asynchronous 202 results.
+  Old low-level Panoramisk control dispatch is blocked. H1 command mappings and
+  disabled DTMF/macro behavior remain covered.
+- Default bind is loopback; query credentials are a legacy-only explicit opt-in.
+  Baseline events need no external scripts.
+- Document indefinite idempotency retention and effect/dispatch uncertainty; add
+  fault-focused offline tests. No new runtime dependencies.
+
 ## [1.4.2] - 2026-09-19
 
 Safety hotfix. Corrects control commands that were verified wrong against
