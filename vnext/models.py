@@ -8,9 +8,10 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 NODE_PATTERN = r"^[1-9][0-9]{0,5}$"
 Node = Annotated[str, StringConstraints(strict=True, pattern=NODE_PATTERN)]
 
-# The only announcement kinds this release supports. Both produce audio the hub
-# itself originates onto its native links: identify queues ID1 into RPT_CONF,
-# and status is rendered by app_rpt's own status telemetry path.
+# The only announcement kinds this release supports. identify queues ID1 into
+# RPT_CONF as hub-originated link audio. status is different: app_rpt sends
+# STATUS telemetry text across the link, and the receiving node renders it
+# according to its own app_rpt version and telemetry policy.
 SUPPORTED_ANNOUNCEMENTS: tuple[str, ...] = ("identify", "status")
 
 # Withdrawn in this release. app_rpt converts time and version into link
